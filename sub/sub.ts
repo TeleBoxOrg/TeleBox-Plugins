@@ -1,10 +1,10 @@
-import { Plugin , type PanelSettingsAdapter, type PanelSettingField } from "@utils/pluginBase";
+import { Plugin } from "@utils/pluginBase";
 import { getGlobalClient } from "@utils/runtimeManager";
 import { getPrefixes } from "@utils/pluginManager";
 import { createDirectoryInTemp } from "@utils/pathHelpers";
 import { Api } from "teleproto";
 import { CustomFile } from "teleproto/client/uploads.js";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -14,13 +14,24 @@ import { safeGetReplyMessage } from "@utils/safeGetMessages";
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
 
-// 执行命令
-function sh(cmd: string): Promise<string> {
+// 安全地执行命令（仅接受固定命令字符串，不支持用户输入插值）
+function sh(cmd: string, args?: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    exec(cmd, { shell: "/bin/bash" }, (err, stdout, stderr) => {
-      if (err) reject(stderr || err.message);
-      else resolve(stdout);
-    });
+    const proc = execFile(
+      "/bin/bash",
+      args !== undefined ? args : ["-c", cmd],
+      { maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) reject(new Error(stderr.trim() || err.message));
+        else resolve(stdout);
+      },
+    );
+    // 超时保护：300 秒后强制 kill
+    const timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      reject(new Error("Command timed out after 300s"));
+    }, 300_000);
+    proc.on("close", () => clearTimeout(timer));
   });
 }
 
@@ -147,6 +158,12 @@ const help = `🧩 <b>Sub-Store 管理</b>
 class SubStorePlugin extends Plugin {
 
   description = `Sub-Store 管理\n\n${help}`;
+
+  async cleanup(): Promise<void> {
+    // 清理 Sub-Store 插件创建的临时文件（日志导出、备份等）
+    // 临时目录由 createDirectoryInTemp 创建，随系统临时目录清理周期自动回收
+    // 此处无需额外操作；若需主动清理可在此扩展
+  }
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     sub: async (msg) => {
@@ -551,36 +568,6 @@ echo "后端: http://\$IP:3001/\$SECRET"`;
         await msg.edit({ text: `❌ ${error.message || error}`.slice(0, 3500) });
       }
     },
-  // Panel Settings Adapter
-  panelAdapter: PanelSettingsAdapter = {
-    id: "sub",
-    title: "SubStore",
-    description: "SubStore 订阅管理配置",
-    category: "插件配置",
-    icon: "📦",
-    getSchema: (): PanelSettingField[] => [
-      {
-            "key": "url",
-            "label": "面板地址",
-            "type": "string"
-      },
-      {
-            "key": "token",
-            "label": "Token",
-            "type": "password",
-            "secret": true
-      }
-],
-    getValues: async (): Promise<Record<string, unknown>> => {
-      const db = await JSONFilePreset<any>(path.join(createDirectoryInAssets("sub"), "config.json"), {} as any);
-      return db.data as Record<string, unknown>;
-    },
-    setValues: async (patch: Record<string, unknown>): Promise<void> => {
-      const db = await JSONFilePreset<any>(path.join(createDirectoryInAssets("sub"), "config.json"), {} as any);
-      Object.assign(db.data, patch);
-      await db.write();
-    },
-  };
   };
 }
 

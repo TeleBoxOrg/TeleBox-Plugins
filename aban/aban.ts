@@ -1,4 +1,5 @@
 import { Plugin } from "@utils/pluginBase";
+import { logger } from "@utils/logger";
 import { getCurrentGenerationContext } from "@utils/runtimeManager";
 import { getPrefixes } from "@utils/pluginManager";
 import { getGlobalClient } from "@utils/runtimeManager";
@@ -26,7 +27,7 @@ async function ensurePLimit(): Promise<typeof pLimit> {
     pLimitReady = (async () => {
       try {
         npm_install("p-limit");
-      } catch {}
+      } catch { /* npm_install 失败可忽略 */ }
       pLimit = (await import("p-limit")).default;
     })();
   }
@@ -43,7 +44,8 @@ function getFloodWaitSeconds(error: unknown): number | null {
   m = msg.match(/wait of (\d+) seconds?/i);
   if (m) return parseInt(m[1], 10);
   // teleproto FloodWaitError 的 seconds 字段
-  const seconds = (error as any)?.seconds;
+  const errObj = error as { seconds?: number | undefined };
+  const seconds = errObj?.seconds;
   if (typeof seconds === "number" && Number.isFinite(seconds)) return seconds;
   return null;
 }
@@ -68,12 +70,11 @@ const HELP_TEXT = `<b>封禁管理</b>
 <code>${mainPrefix}unban</code> 解封
 <code>${mainPrefix}mute [time]</code> 禁言 (如 60s/5m/1h/1d，不填则永久)
 <code>${mainPrefix}unmute</code> 解禁言
-<code>${mainPrefix}sb</code> 批量封禁（仅有管理权的群）
-<code>${mainPrefix}unsb</code> 批量解封（仅有管理权的群）
-<code>${mainPrefix}refresh</code> 刷新管理群缓存
+<code>${mainPrefix}sb</code> 批量封禁
+<code>${mainPrefix}unsb</code> 批量解封
+<code>${mainPrefix}refresh</code> 刷新
 
-目标：回复消息 / <code>@用户名</code> / <code>用户ID</code>
-<code>用户ID</code> 不要求对方在当前群；会从会话缓存与管理群解析`;
+回复消息或@用户名`;
 
 // ==================== 工具函数 ====================
 // 解析时间字符串
@@ -158,22 +159,15 @@ type ResolvedTarget = {
 };
 
 class UserResolver {
-  private static isMetaFlag(arg: string): boolean {
-    const a = arg.trim().toLowerCase();
-    return a === "true" || a === "false" || a === "confirm";
-  }
-
   static async resolveTarget(
     client: TelegramClient,
     message: Api.Message,
     args: string[]
   ): Promise<ResolvedTarget> {
-    // true/false 是确认位，不是目标；`.sb true` 应回落到回复消息
-    const targetArgs = args.filter((a) => !this.isMetaFlag(a));
-
     // 从参数解析
-    if (targetArgs.length > 0) {
-      return await this.resolveFromString(client, message, targetArgs[0]);
+    if (args.length > 0) {
+      const target = args[0];
+      return await this.resolveFromString(client, message, target);
     }
     
     // 从回复消息解析
@@ -223,21 +217,25 @@ class UserResolver {
         };
       }
       
-      // 纯数字 ID（不要求目标在当前聊天）
+      // 纯数字 ID
       if (/^-?\d+$/.test(target)) {
         const userId = parseInt(target, 10);
-        const resolved = await this.resolveNumericUser(client, message, userId);
+        const entity = await this.safeGetEntity(client, userId);
+        const participant = entity
+          ? await this.safeGetInputEntity(client, entity)
+          : await this.resolveParticipantFromContext(client, message, userId);
+
         return {
-          user: resolved.user,
+          user: entity,
           uid: userId,
-          participant: resolved.participant,
+          participant,
           source: "numeric",
-          resolutionError: resolved.participant ? undefined : "TARGET_ENTITY_UNRESOLVABLE",
+          resolutionError: participant ? undefined : "TARGET_ENTITY_UNRESOLVABLE",
           chatType: this.getChatType(message),
         };
       }
     } catch (error) {
-      console.error(`[UserResolver] 解析失败: ${error}`);
+      logger.error(`[UserResolver] 解析失败: ${error}`);
     }
     
     return { user: null, uid: null, source: "unknown", resolutionError: "INVALID_TARGET", chatType: this.getChatType(message) };
@@ -245,15 +243,18 @@ class UserResolver {
 
   private static async getReplySender(reply: Api.Message): Promise<any> {
     try {
-      return await (reply as any).getSender?.();
-    } catch {
+      // reply.getSender 可能不存在于类型定义中
+      const replyWithSender = reply as { getSender: () => Promise<any>; sender: any };
+      return await replyWithSender.getSender?.();
+    } catch { /* getSender 失败时 fallback 到 reply.sender */
       return reply.sender;
     }
   }
 
   private static getChatType(message: Api.Message): "channel" | "chat" | "unknown" {
-    if ((message as any).isChannel) return "channel";
-    if ((message as any).isGroup) return "chat";
+    const msg = message as { isChannel?: boolean; isGroup?: boolean };
+    if (msg.isChannel) return "channel";
+    if (msg.isGroup) return "chat";
     return "unknown";
   }
 
@@ -263,7 +264,7 @@ class UserResolver {
   ): Promise<any | null> {
     try {
       return await client.getEntity(target);
-    } catch {
+    } catch { /* getEntity 失败时返回 null */
       return null;
     }
   }
@@ -274,7 +275,7 @@ class UserResolver {
   ): Promise<any | undefined> {
     try {
       return await client.getInputEntity(target);
-    } catch {
+    } catch { /* getInputEntity 失败时返回 undefined */
       return undefined;
     }
   }
@@ -285,17 +286,14 @@ class UserResolver {
     userId: number,
     knownEntity?: any
   ): Promise<any | undefined> {
-    const chat = (message as any).peerId;
+    const msgForPeer = message as { peerId?: any; isChannel?: boolean; isGroup?: boolean };
+    const chat = msgForPeer.peerId;
     if (!chat) {
       return undefined;
     }
 
-    if ((message as any).isChannel) {
+    if (msgForPeer.isChannel) {
       try {
-        // 优先 getParticipant(accessHash=0)：目标是成员/可解析时一次成功，且不要求“当前页”
-        const viaPart = await this.resolveUserViaGetParticipant(client, chat, userId);
-        if (viaPart) return viaPart;
-
         let offset = 0;
         const limit = 200;
         for (let i = 0; i < 5; i++) {
@@ -305,7 +303,7 @@ class UserResolver {
               filter: new Api.ChannelParticipantsRecent(),
               offset,
               limit,
-              hash: 0 as any,
+              hash: bigInt(0),
             })
           );
 
@@ -322,15 +320,16 @@ class UserResolver {
           if (!participants.length) break;
           offset += participants.length;
         }
-      } catch {
+      } catch { /* 无法从频道获取参与者，返回 undefined */
         return undefined;
       }
     }
 
-    if ((message as any).isGroup) {
+    if (msgForPeer.isGroup) {
       try {
         const peer: any = knownEntity || await this.safeGetEntity(client, chat);
-        const chatId = Number(peer?.chatId ?? peer?.id ?? (chat as any)?.chatId);
+        const chatWithChatId = chat as { chatId?: number };
+        const chatId = Number(peer?.chatId ?? peer?.id ?? chatWithChatId?.chatId);
         if (!Number.isFinite(chatId)) {
           return undefined;
         }
@@ -351,168 +350,12 @@ class UserResolver {
         if (matchedUser) {
           return await this.safeGetInputEntity(client, matchedUser);
         }
-      } catch {
+      } catch { /* 无法从群组获取参与者，返回 undefined */
         return undefined;
       }
     }
 
     return undefined;
-  }
-
-  /**
-   * 按用户数字 ID 解析 InputPeer。
-   * 目标不必在当前聊天：本地缓存 → 当前群 → 跨管理群 getParticipant → 频道 accessHash=0 试探。
-   */
-  private static async resolveNumericUser(
-    client: TelegramClient,
-    message: Api.Message,
-    userId: number,
-  ): Promise<{ user: any; participant?: any }> {
-    let entity = await this.safeGetEntity(client, userId);
-    let participant = entity
-      ? await this.safeGetInputEntity(client, entity)
-      : await this.safeGetInputEntity(client, userId);
-
-    if (!participant) {
-      participant = await this.resolveParticipantFromContext(client, message, userId, entity);
-    }
-
-    // 当前频道/超群：getParticipant(accessHash=0) 可回填实体（即使目标已不在群，有时仍可）
-    if (!participant && (message as any).isChannel) {
-      participant = await this.resolveUserViaGetParticipant(client, (message as any).peerId, userId);
-      if (!entity && participant) {
-        entity = await this.safeGetEntity(client, userId);
-      }
-    }
-
-    if (!participant) {
-      const cross = await this.resolveUserAcrossManagedGroups(client, userId, (message as any).peerId);
-      if (cross.participant) {
-        participant = cross.participant;
-        if (!entity && cross.entity) entity = cross.entity;
-      }
-    }
-
-    // 频道/超群：仍无 hash 时用 accessHash=0 试探（预封禁场景）
-    if (!participant && (message as any).isChannel) {
-      try {
-        participant = new Api.InputPeerUser({
-          userId: bigInt(userId),
-          accessHash: bigInt(0),
-        });
-      } catch {
-        participant = undefined;
-      }
-    }
-
-    return { user: entity, participant };
-  }
-
-  /** 频道内用裸 userId + accessHash 0 解析成员 */
-  private static async resolveUserViaGetParticipant(
-    client: TelegramClient,
-    chat: any,
-    userId: number,
-  ): Promise<any | undefined> {
-    if (!chat || !userId) return undefined;
-    try {
-      const res: any = await client.invoke(
-        new Api.channels.GetParticipant({
-          channel: chat,
-          participant: new Api.InputPeerUser({
-            userId: bigInt(userId),
-            accessHash: bigInt(0),
-          }),
-        })
-      );
-      const matched = (res?.users || []).find((u: any) => Number(u?.id) === userId);
-      if (matched) {
-        return await this.safeGetInputEntity(client, matched);
-      }
-    } catch {
-      return undefined;
-    }
-    return undefined;
-  }
-
-  /**
-   * 在管理群中按 userId 解析实体；目标不必与命令同群。
-   */
-  private static async resolveUserAcrossManagedGroups(
-    client: TelegramClient,
-    userId: number,
-    excludePeer?: any,
-  ): Promise<{ participant?: any; entity?: any }> {
-    if (!userId) return {};
-    let groups: ManagedGroup[] = [];
-    try {
-      groups = await GroupManager.getManagedGroups(client);
-    } catch {
-      return {};
-    }
-    if (!groups.length) return {};
-
-    const excludeId = excludePeer
-      ? Number(
-          excludePeer?.channelId ??
-            excludePeer?.chatId ??
-            excludePeer?.userId ??
-            excludePeer?.id ??
-            0,
-        )
-      : 0;
-
-    const ordered = [
-      ...groups.filter((g) => g.kind === "channel"),
-      ...groups.filter((g) => g.kind === "chat"),
-    ];
-
-    const limit = (await ensurePLimit())(6);
-    let found: { participant?: any; entity?: any } = {};
-
-    await Promise.all(
-      ordered.map((group) =>
-        limit(async () => {
-          if (found.participant) return;
-          if (excludeId && Number(group.id) === excludeId) return;
-          try {
-            if (group.kind === "channel") {
-              const channel = await resolveChannelInput(client, group);
-              const res: any = await client.invoke(
-                new Api.channels.GetParticipant({
-                  channel: channel as any,
-                  participant: new Api.InputPeerUser({
-                    userId: bigInt(userId),
-                    accessHash: bigInt(0),
-                  }),
-                })
-              );
-              const matched = (res?.users || []).find((u: any) => Number(u?.id) === userId);
-              if (matched && !found.participant) {
-                const input = await this.safeGetInputEntity(client, matched);
-                if (input) found = { participant: input, entity: matched };
-              }
-              return;
-            }
-
-            const full: any = await client.invoke(
-              new Api.messages.GetFullChat({
-                chatId: bigInt(Math.abs(Number(group.id))),
-              })
-            );
-            const matched = (full?.users || []).find((u: any) => Number(u?.id) === userId);
-            if (matched && !found.participant) {
-              const input = await this.safeGetInputEntity(client, matched);
-              if (input) found = { participant: input, entity: matched };
-            }
-          } catch {
-            // skip
-          }
-        }),
-      ),
-    );
-
-    return found;
   }
 
   static formatUser(user: any, userId: number): string {
@@ -562,7 +405,7 @@ class MessageManager {
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e);
               if (!msg.includes('MESSAGE_ID_INVALID')) {
-                console.error(`删除消息失败: ${e}`);
+                logger.error(`删除消息失败: ${e}`);
               }
             }
           }, deleteAfter * 1000, { label: 'aban:smartEdit-delayed-delete' });
@@ -575,7 +418,7 @@ class MessageManager {
       if (errMsg.includes('MESSAGE_ID_INVALID')) {
         // Expected when the target message was already deleted - not actionable
       } else {
-        console.error(`编辑消息失败: ${errMsg}`);
+        logger.error(`编辑消息失败: ${errMsg}`);
       }
       return message;
     }
@@ -647,7 +490,7 @@ class PermissionManager {
       new Api.messages.GetFullChat({
         chatId: bigInt(this.getBasicGroupChatId(chatId)),
       })
-    ) as any;
+    ) as { fullChat?: { participants: any } };
 
     const participants = full?.fullChat?.participants;
     if (!participants || participants instanceof Api.ChatParticipantsForbidden) {
@@ -670,7 +513,7 @@ class PermissionManager {
           return false;
         }
 
-        const meParticipant = participants.find((p: any) => Number(p?.userId) === Number((me as any).id));
+        const meParticipant = participants.find((p: any) => Number(p?.userId) === Number(me.id));
         return meParticipant instanceof Api.ChatParticipantCreator || meParticipant instanceof Api.ChatParticipantAdmin;
       }
 
@@ -739,7 +582,7 @@ class PermissionManager {
           return false;
         }
 
-        const meParticipant = participants.find((p: any) => Number(p?.userId) === Number((me as any).id));
+        const meParticipant = participants.find((p: any) => Number(p?.userId) === Number(me.id));
         return meParticipant instanceof Api.ChatParticipantCreator || meParticipant instanceof Api.ChatParticipantAdmin;
       }
 
@@ -756,7 +599,7 @@ class PermissionManager {
         return !!p.adminRights?.deleteMessages;
       }
       return false;
-    } catch {
+    } catch { /* 权限检查失败时视为无权限 */
       return false;
     }
   }
@@ -784,70 +627,53 @@ class GroupManager {
     return Array.from(dialogMap.values());
   }
 
-  /**
-   * teleproto Dialog.entity（Channel/Chat）自带 creator/adminRights，
-   * 比逐群 GetParticipant 更稳：无 RPC、无 accessHash 假阴性。
-   */
-  private static dialogHasManageRights(dialog: any): boolean {
-    const entity = dialog?.entity;
-    if (!entity) return false;
-    if (entity.creator) return true;
-    const rights = entity.adminRights;
-    if (!rights) return false;
-    return !!(rights.banUsers || rights.deleteMessages);
-  }
-
   static async getManagedGroups(
     client: TelegramClient
   ): Promise<ManagedGroup[]> {
-    // v5: 用 dialog.entity.creator/adminRights 本地过滤（零 RPC）。
-    // v4 对每群 GetParticipant，易假阴性 → refresh 统计为 0；空数组也会被当成有效缓存。
-    const cached = await this.cache.get("managed_groups_v5");
-    if (cached && Array.isArray(cached) && cached.length > 0) return cached;
+    const cached = await this.cache.get("managed_groups_v3");
+    if (cached) return cached;
 
     const groups: ManagedGroup[] = [];
     
     try {
       const dialogs = await this.getAllManageableDialogs(client);
-
-      let skippedNoRights = 0;
-      for (const dialog of dialogs || []) {
-        if (!(dialog.isChannel || dialog.isGroup)) continue;
-        if (!this.dialogHasManageRights(dialog)) {
-          skippedNoRights++;
-          continue;
+      
+      const checkPromises = dialogs.map(async (dialog: any) => {
+        if (dialog.isChannel || dialog.isGroup) {
+          // 不再预检查管理员权限，统一纳入所有群组/频道。
+          // 批量操作（sb/unsb）会由各群组的实际 API 调用返回权限错误，
+          // 避免了 checkAdminPermission 因 peerId 格式或边缘情况导致的误判。
+          const isChannel = !(dialog.isGroup && !dialog.isChannel);
+          // 仅 channel 需要 accessHash，basic group 用裸 chatId
+          const rawHash = isChannel ? dialog.entity?.accessHash : undefined;
+          const accessHash = rawHash != null ? String(rawHash) : undefined;
+          // ⚠️ dialog.id 是 marked id（channel: -100xxxx，basic group: -xxx），
+          // 而 Api.InputChannel.channelId / Api.messages.DeleteChatUser.chatId 需要 raw 正数 id。
+          // 这里必须用 dialog.entity.id（Channel/Chat 实体上的原始正数 id），否则服务端会
+          // 直接 CHANNEL_INVALID / PEER_ID_INVALID，导致批量 sb 全部失败。
+          const rawId = Number(dialog.entity?.id ?? dialog.id);
+          return {
+            id: rawId,
+            title: dialog.title || "Unknown",
+            kind: isChannel ? 'channel' as const : 'chat' as const,
+            accessHash,
+          };
         }
-        const isChannel = !(dialog.isGroup && !dialog.isChannel);
-        const rawHash = isChannel ? dialog.entity?.accessHash : undefined;
-        const accessHash = rawHash != null ? String(rawHash) : undefined;
-        // ⚠️ dialog.id 是 marked id；API 需要 entity 上的 raw 正数 id
-        const rawId = Number(dialog.entity?.id ?? dialog.id);
-        if (!Number.isFinite(rawId) || rawId === 0) continue;
-        groups.push({
-          id: rawId,
-          title: dialog.title || "Unknown",
-          kind: isChannel ? 'channel' as const : 'chat' as const,
-          accessHash,
-        });
+        return null;
+      });
+      
+      const results = await Promise.all(checkPromises);
+      for (const g of results) {
+        if (g !== null) groups.push(g as ManagedGroup);
       }
-      console.log(
-        `[GroupManager] 有管理权群组 ${groups.length}/${(dialogs || []).length}（本地 adminRights 过滤，跳过无权限 ${skippedNoRights}）`
-      );
       
       try {
-        await this.cache.set("managed_groups_v5", groups);
-        // 作废可能被假阴性写空的 v4
-        try {
-          await this.cache.set("managed_groups_v4", []);
-        } catch {}
-        try {
-          await this.cache.set("managed_groups_v3", []);
-        } catch {}
+        await this.cache.set("managed_groups_v3", groups);
       } catch (cacheError) {
-        console.error(`[GroupManager] 缓存群组失败: ${cacheError}`);
+        logger.error(`[GroupManager] 缓存群组失败: ${cacheError}`);
       }
     } catch (error) {
-      console.error(`[GroupManager] 获取群组失败: ${error}`);
+      logger.error(`[GroupManager] 获取群组失败: ${error}`);
     }
     
     return groups;
@@ -889,19 +715,8 @@ class BanManager {
 
   private static getErrorReason(error: unknown): string {
     const message = error instanceof Error ? error.message : String(error || "UNKNOWN_ERROR");
-    // 优先取 Telegram RPC 错误码；勿用 /[A-Z_]{3,}/ 以免命中 "Telegram API error" 里的 API
-    const rpcCodes = message.match(/\b[A-Z][A-Z0-9_]{4,}\b/g) || [];
-    const skip = new Set(["TELEGRAM", "ERROR", "UNKNOWN", "UNKNOWN_ERROR"]);
-    for (const code of rpcCodes) {
-      if (skip.has(code)) continue;
-      if (code === "API") continue;
-      return code;
-    }
-    const textField = (error as any)?.text;
-    if (typeof textField === "string" && /^[A-Z][A-Z0-9_]{3,}$/.test(textField)) {
-      return textField;
-    }
-    return message.slice(0, 80) || "UNKNOWN_ERROR";
+    const match = message.match(/[A-Z_]{3,}/);
+    return match?.[0] || message;
   }
 
   private static getChatKind(chatId: any): ChatKind {
@@ -976,7 +791,7 @@ class BanManager {
       await this.applyBanLikeAction(client, chatId, resolvedParticipant, rights, 'ban');
       return true;
     } catch (error) {
-      console.error(`[BanManager] 封禁失败: ${error}`);
+      logger.error(`[BanManager] 封禁失败: ${error}`);
       return false;
     }
   }
@@ -996,7 +811,7 @@ class BanManager {
       await this.applyBanLikeAction(client, chatId, resolvedParticipant, rights, 'unban');
       return true;
     } catch (error) {
-      console.error(`[BanManager] 解封失败: ${error}`);
+      logger.error(`[BanManager] 解封失败: ${error}`);
       return false;
     }
   }
@@ -1025,7 +840,7 @@ class BanManager {
       await this.applyBanLikeAction(client, chatId, resolvedParticipant, rights, 'mute');
       return true;
     } catch (error) {
-      console.error(`[BanManager] 禁言失败: ${error}`);
+      logger.error(`[BanManager] 禁言失败: ${error}`);
       return false;
     }
   }
@@ -1048,7 +863,7 @@ class BanManager {
 
       return await this.unbanUser(client, chatId, userId, participant);
     } catch (error) {
-      console.error(`[BanManager] 踢出失败: ${error}`);
+      logger.error(`[BanManager] 踢出失败: ${error}`);
       return false;
     }
   }
@@ -1063,7 +878,7 @@ class BanManager {
     try {
       const canDelete = await PermissionManager.canDeleteMessages(client, chatId);
       if (!canDelete) {
-        console.log(`[BanManager] 无删除消息权限`);
+        logger.info(`[BanManager] 无删除消息权限`);
         return false;
       }
 
@@ -1076,12 +891,12 @@ class BanManager {
         })
       );
       
-      console.log(`[BanManager] 成功删除用户 ${userId} 在当前会话的所有消息`);
+      logger.info(`[BanManager] 成功删除用户 ${userId} 在当前会话的所有消息`);
       return true;
     } catch (error: any) {
       // 静默处理常见错误
       if (!/CHANNEL_INVALID|CHAT_ADMIN_REQUIRED|USER_NOT_PARTICIPANT/.test(error?.message || "")) {
-        console.error(`[BanManager] 删除消息失败: ${error?.message}`);
+        logger.error(`[BanManager] 删除消息失败: ${error?.message}`);
       }
       return false;
     }
@@ -1333,7 +1148,7 @@ class CommandHandlers {
       const basicGroupActionAllowedWithoutParticipant = chatType === 'chat' && ['ban', 'kick'].includes(action);
       if (!participant && ['ban', 'unban', 'mute', 'unmute', 'kick'].includes(action) && !basicGroupActionAllowedWithoutParticipant) {
         const errorText = resolutionError === 'TARGET_ENTITY_UNRESOLVABLE'
-          ? '❌ 无法解析该用户ID（会话未见过且不在管理群中）。可先回复其一则消息，或确认 ID 正确'
+          ? '❌ 无法解析该目标的 Telegram 实体，请使用回复消息或 @用户名 后再试'
           : '❌ 获取用户失败';
         await MessageManager.smartEdit(message, errorText);
         return;
@@ -1436,7 +1251,7 @@ class CommandHandlers {
 
       if (!participant) {
         const errorText = resolutionError === 'TARGET_ENTITY_UNRESOLVABLE'
-          ? '❌ 无法解析该用户ID（会话未见过且不在任一管理群中）。可先 `.refresh` 后重试，或回复其一则消息'
+          ? '❌ 无法解析该目标的 Telegram 实体，请先通过回复消息、@用户名或让该目标在当前会话中可见后再试'
           : '❌ 获取用户失败';
         await MessageManager.smartEdit(message, errorText);
         return;
@@ -1458,7 +1273,7 @@ class CommandHandlers {
             try {
               const target = await resolvePermissionTarget(client, group);
               return await PermissionManager.isTargetAdmin(client, target, uid);
-            } catch {
+            } catch { /* 检查失败视为非管理员 */
               return false;
             }
           })
@@ -1479,7 +1294,8 @@ class CommandHandlers {
       const display = UserResolver.formatUser(user, uid);
 
       // 立即返回处理中状态
-      const statusActionText = (message as any).isGroup && !(message as any).isChannel ? '移出' : '封禁';
+      const msgForAction = message as { isGroup?: boolean; isChannel?: boolean };
+      const statusActionText = msgForAction.isGroup && !msgForAction.isChannel ? '移出' : '封禁';
       const status = await MessageManager.smartEdit(
         message,
         `⚡ 在${groups.length}个频道/群组中${statusActionText}该用户...`,
@@ -1524,7 +1340,7 @@ class CommandHandlers {
         };
 
         if (failureDetails.length > 0) {
-          console.warn(`[sb] 封禁失败汇总: failed=${failureDetails.length}, unresolved=${unresolved ? 'yes' : 'no'}, reasons=[${summarizeReasonsPlain(failureDetails)}]`);
+          logger.warn(`[sb] 封禁失败汇总: failed=${failureDetails.length}, unresolved=${unresolved ? 'yes' : 'no'}, reasons=[${summarizeReasonsPlain(failureDetails)}]`);
         }
 
         const summarizeReasons = (details: BatchGroupFailure[]): string => {
@@ -1549,7 +1365,7 @@ class CommandHandlers {
           : '';
 
         // 更新最终结果
-        const finalActionText = (message as any).isGroup && !(message as any).isChannel ? '移出' : '封禁';
+        const finalActionText = msgForAction.isGroup && !msgForAction.isChannel ? '移出' : '封禁';
         const result = `✅ 在${success}个频道/群组中${finalActionText}该用户 ${htmlEscape(display)}${failureSummary}${capabilityNote}\n🗑️当前群组消息: ${deleteSuccess ? '✓已清理' : '✗'} | ⏱️${elapsed.toFixed(1)}s`;
         
         // 更新为最终结果
@@ -1585,7 +1401,7 @@ class CommandHandlers {
 
       if (!participant) {
         const errorText = resolutionError === 'TARGET_ENTITY_UNRESOLVABLE'
-          ? '❌ 无法解析该用户ID（会话未见过且不在任一管理群中）。可先 `.refresh` 后重试，或回复其一则消息'
+          ? '❌ 无法解析该目标的 Telegram 实体，请先通过回复消息、@用户名或让该目标在当前会话中可见后再试'
           : '❌ 获取用户失败';
         await MessageManager.smartEdit(message, errorText);
         return;
@@ -1607,7 +1423,7 @@ class CommandHandlers {
             try {
               const target = await resolvePermissionTarget(client, group);
               return await PermissionManager.isTargetAdmin(client, target, uid);
-            } catch {
+            } catch { /* 检查失败视为非管理员 */
               return false;
             }
           })
@@ -1653,7 +1469,7 @@ class CommandHandlers {
 
         // 内部日志：记录失败原因
         if (!unresolved && failed > 0) {
-          console.warn(`[unsb] 解封失败: failed=${failed}/${groups.length}`);
+          logger.warn(`[unsb] 解封失败: failed=${failed}/${groups.length}`);
         }
 
         const failureSummary = unresolved
@@ -1772,9 +1588,9 @@ class AbanPlugin extends Plugin {
       const status = await MessageManager.smartEdit(msg, "🔄 刷新中...", 0);
       
       try {
-        await GroupManager.clearCache();
+        GroupManager.clearCache();
         const groups = await GroupManager.getManagedGroups(client);
-        await MessageManager.smartEdit(status, `✅ 已刷新 ${groups.length} 个有管理权的群组`);
+        await MessageManager.smartEdit(status, `✅ 已刷新 ${groups.length}个群组`);
       } catch (error: any) {
         await MessageManager.smartEdit(status, `❌ 刷新失败`);
       }

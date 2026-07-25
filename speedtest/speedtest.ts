@@ -3,7 +3,7 @@
  * Converted from PagerMaid-Modify speednext.py
  */
 
-import { Plugin , type PanelSettingsAdapter, type PanelSettingField } from "@utils/pluginBase";
+import { Plugin } from "@utils/pluginBase";
 import { Api } from "teleproto";
 import { getGlobalClient } from "@utils/runtimeManager";
 import { TelegramClient } from "teleproto";
@@ -121,7 +121,7 @@ async function fillRoundedCorners(
     (() => {
       const dir = path.dirname(inputPath);
       const ext =
-        meta.format === "jpeg" || meta.format === "jpg" ? ".jpg" : ".png";
+        meta.format === "jpeg" ? ".jpg" : ".png";
       const base = path.basename(inputPath, path.extname(inputPath));
       return path.join(dir, `${base}.filled${ext}`);
     })();
@@ -160,7 +160,7 @@ async function fillRoundedCorners(
   let composed = background.composite([{ input: innerBuf, left, top }]);
 
   // Encode based on original format; default to PNG if unknown
-  if (meta.format === "jpeg" || meta.format === "jpg") {
+  if (meta.format === "jpeg") {
     composed = composed.jpeg({ quality: 95 });
   } else if (meta.format === "png" || !meta.format) {
     composed = composed.png({ compressionLevel: 9 });
@@ -1508,45 +1508,6 @@ class SpeednextPlugin extends Plugin {
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     speedtest,
     st: speedtest,
-  // Panel Settings Adapter
-  panelAdapter: PanelSettingsAdapter = {
-    id: "speedtest",
-    title: "Speedtest 测速",
-    description: "网络测速配置",
-    category: "插件配置",
-    icon: "🚀",
-    getSchema: (): PanelSettingField[] => [
-      {
-            "key": "default_server_id",
-            "label": "默认服务器 ID",
-            "type": "number"
-      },
-      {
-            "key": "preferred_type",
-            "label": "首选消息类型",
-            "type": "select",
-            "options": [
-                  {
-                        "value": "text",
-                        "label": "文本"
-                  },
-                  {
-                        "value": "photo",
-                        "label": "图片"
-                  }
-            ]
-      }
-],
-    getValues: async (): Promise<Record<string, unknown>> => {
-      const db = await JSONFilePreset<SpeedtestConfig>(path.join(createDirectoryInAssets("speedtest"), "config.json"), {} as any);
-      return db.data as Record<string, unknown>;
-    },
-    setValues: async (patch: Record<string, unknown>): Promise<void> => {
-      const db = await JSONFilePreset<SpeedtestConfig>(path.join(createDirectoryInAssets("speedtest"), "config.json"), {} as any);
-      Object.assign(db.data, patch);
-      await db.write();
-    },
-  };
   };
 }
 

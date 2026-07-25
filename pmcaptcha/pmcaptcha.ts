@@ -1,12 +1,10 @@
-//@ts-nocheck
 import { Api, TelegramClient } from "teleproto";
 import { CustomFile } from "teleproto/client/uploads";
 import path from "path";
 import fs from "fs";
-import { execSync } from "child_process";
 import { JSONFilePreset } from "lowdb/node";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
-import { Plugin, type PanelSettingsAdapter, type PanelSettingField } from "@utils/pluginBase";
+import { Plugin, type PluginRuntimeContext } from "@utils/pluginBase";
 import { getCurrentGeneration, tryGetCurrentGenerationContext } from "@utils/runtimeManager";
 import type { GenerationContext } from "@utils/generationContext";
 import { getPrefixes } from "@utils/pluginManager";
@@ -15,24 +13,16 @@ import { safeGetMessages } from "@utils/safeGetMessages";
 
 import { safeGetMe } from "@utils/authGuards";
 import { htmlEscape } from "@utils/htmlEscape";
+import { logger } from "@utils/logger";
 
 const PLUGIN_VERSION = "5.0.7";
 
-function codeTag(value: any): string {
-  return `<code>${htmlEscape(value)}</code>`;
+function codeTag(value: string | number): string {
+  return `<code>${htmlEscape(String(value))}</code>`;
 }
 
-function attrEscape(value: any): string {
-  return htmlEscape(value).replace(/'/g, "&#39;");
-}
-
-// ─── 日志 ─────────────────────────────────────────────────────────────────────
-
-enum LogLevel { INFO = 1, WARN = 2, ERROR = 3 }
-
-function log(level: LogLevel, message: string, data?: any) {
-  const prefix = `[PMCaptcha] [${new Date().toISOString()}] [${LogLevel[level]}]`;
-  data ? console.log(`${prefix} ${message}`, data) : console.log(`${prefix} ${message}`);
+function attrEscape(value: string | number): string {
+  return htmlEscape(String(value)).replace(/'/g, "&#39;");
 }
 
 // ─── 枚举 ─────────────────────────────────────────────────────────────────────
@@ -192,11 +182,11 @@ if (fs.existsSync(legacyDataDir)) {
 
   if (fs.existsSync(legacyConfig) && !fs.existsSync(newConfig)) {
     fs.copyFileSync(legacyConfig, newConfig);
-    log(LogLevel.INFO, `Migrated config: ${legacyConfig} → ${newConfig}`);
+    logger.info( `Migrated config: ${legacyConfig} → ${newConfig}`);
   }
   if (fs.existsSync(legacyData) && !fs.existsSync(newData)) {
     fs.copyFileSync(legacyData, newData);
-    log(LogLevel.INFO, `Migrated data: ${legacyData} → ${newData}`);
+    logger.info( `Migrated data: ${legacyData} → ${newData}`);
   }
 }
 
@@ -214,9 +204,9 @@ async function initDb() {
       JSONFilePreset(path.join(dataDir, "pmcaptcha_data.json"),   DEFAULT_DATA)   as Promise<JsonDb>,
     ]);
     dbReady = true;
-    log(LogLevel.INFO, `Config DB ready | Data DB: ${path.join(dataDir, "pmcaptcha_data.json")}`);
+    logger.info( `Config DB ready | Data DB: ${path.join(dataDir, "pmcaptcha_data.json")}`);
   } catch (e) {
-    log(LogLevel.ERROR, "DB init failed", e);
+    logger.error( "DB init failed", e);
   }
 }
 
@@ -253,11 +243,11 @@ function set(key: string, value: any) {
   if (key in DEFAULT_DATA) {
     if (!dataDb) return;
     dataDb.data[key] = value;
-    dataDb.write().catch(e => log(LogLevel.ERROR, `data write failed: ${key}`, e));
+    dataDb.write().catch(e => logger.error( `data write failed: ${key}`, e));
   } else {
     if (!configDb) return;
     configDb.data[key] = value;
-    configDb.write().catch(e => log(LogLevel.ERROR, `config write failed: ${key}`, e));
+    configDb.write().catch(e => logger.error( `config write failed: ${key}`, e));
   }
 }
 
@@ -390,7 +380,7 @@ async function cachePeerFromMessage(message: Api.Message, userId: number): Promi
   try {
     const peer = await (message as any).getInputChat?.();
     cacheInputPeer(userId, peer);
-  } catch {}
+  } catch { /* entity resolve failed, ignore */ }
 }
 
 async function fetchUserInfo(client: TelegramClient, userId: number): Promise<any | null> {
@@ -398,7 +388,7 @@ async function fetchUserInfo(client: TelegramClient, userId: number): Promise<an
     const e = await client.getEntity(userId) as any;
     cacheUserFromSender(e);
     return e;
-  } catch {}
+  } catch { /* entity not found, continue to fallback */ }
 
   try {
     const input = await client.getInputEntity(bigInt(userId));
@@ -412,7 +402,7 @@ async function fetchUserInfo(client: TelegramClient, userId: number): Promise<an
         return user;
       }
     }
-  } catch {}
+  } catch { /* users.getUsers failed, ignore */ }
 
   return null;
 }
@@ -448,7 +438,7 @@ async function archiveChat(client: TelegramClient, userId: number) {
     await client.invoke(new Api.folders.EditPeerFolders({
       folderPeers: [new Api.InputFolderPeer({ peer, folderId: 1 })]
     }));
-  } catch (e) { log(LogLevel.ERROR, `archive failed ${userId}`, e); }
+  } catch (e) { logger.error( `archive failed ${userId}`, e); }
 }
 
 async function muteChat(client: TelegramClient, userId: number) {
@@ -458,23 +448,23 @@ async function muteChat(client: TelegramClient, userId: number) {
       peer: new Api.InputNotifyPeer({ peer }),
       settings: new Api.InputPeerNotifySettings({ muteUntil: 2147483647, showPreviews: false, silent: true })
     }));
-  } catch (e) { log(LogLevel.ERROR, `mute failed ${userId}`, e); }
+  } catch (e) { logger.error( `mute failed ${userId}`, e); }
 }
 
 async function blockUser(client: TelegramClient, userId: number) {
   try {
     const peer = await resolveInputPeer(client, userId);
     await client.invoke(new Api.contacts.Block({ id: peer }));
-    log(LogLevel.INFO, `Blocked ${userId}`);
-  } catch (e) { log(LogLevel.ERROR, `block failed ${userId}`, e); }
+    logger.info( `Blocked ${userId}`);
+  } catch (e) { logger.error( `block failed ${userId}`, e); }
 }
 
 async function deleteHistory(client: TelegramClient, userId: number) {
   try {
     const peer = await resolveInputPeer(client, userId);
     await client.invoke(new Api.messages.DeleteHistory({ peer, revoke: false, maxId: 0 }));
-    log(LogLevel.INFO, `Deleted history ${userId}`);
-  } catch (e) { log(LogLevel.ERROR, `delete history failed ${userId}`, e); }
+    logger.info( `Deleted history ${userId}`);
+  } catch (e) { logger.error( `delete history failed ${userId}`, e); }
 }
 
 async function reportSpam(client: TelegramClient, userId: number) {
@@ -483,8 +473,8 @@ async function reportSpam(client: TelegramClient, userId: number) {
     await client.invoke(new Api.account.ReportPeer({
       peer, reason: new Api.InputReportReasonSpam(), message: "spam"
     }));
-    log(LogLevel.INFO, `Reported ${userId}`);
-  } catch (e) { log(LogLevel.ERROR, `report failed ${userId}`, e); }
+    logger.info( `Reported ${userId}`);
+  } catch (e) { logger.error( `report failed ${userId}`, e); }
 }
 
 async function unmuteChat(client: TelegramClient, userId: number) {
@@ -494,7 +484,7 @@ async function unmuteChat(client: TelegramClient, userId: number) {
       peer: new Api.InputNotifyPeer({ peer }),
       settings: new Api.InputPeerNotifySettings({ muteUntil: 0, showPreviews: true, silent: false })
     }));
-  } catch (e) { log(LogLevel.ERROR, `unmute failed ${userId}`, e); }
+  } catch (e) { logger.error( `unmute failed ${userId}`, e); }
 }
 
 async function unarchiveChat(client: TelegramClient, userId: number) {
@@ -503,7 +493,7 @@ async function unarchiveChat(client: TelegramClient, userId: number) {
     await client.invoke(new Api.folders.EditPeerFolders({
       folderPeers: [new Api.InputFolderPeer({ peer, folderId: 0 })]
     }));
-  } catch (e) { log(LogLevel.ERROR, `unarchive failed ${userId}`, e); }
+  } catch (e) { logger.error( `unarchive failed ${userId}`, e); }
 }
 
 async function runFailActions(client: TelegramClient, userId: number) {
@@ -516,8 +506,8 @@ async function runFailActions(client: TelegramClient, userId: number) {
       try {
         const peer = await resolveInputPeer(client, userId);
         await client.invoke(new Api.messages.DeleteHistory({ peer, revoke: true, maxId: 0 }));
-        log(LogLevel.INFO, `Deleted history (revoke both sides) ${userId}`);
-      } catch (e) { log(LogLevel.ERROR, `delete failed ${userId}`, e); }
+        logger.info( `Deleted history (revoke both sides) ${userId}`);
+      } catch (e) { logger.error( `delete failed ${userId}`, e); }
     }
     if (a === FailAction.REPORT)  await reportSpam(client, userId);
     if (a === FailAction.MUTE)    await muteChat(client, userId);
@@ -535,54 +525,19 @@ async function runPassActions(client: TelegramClient, userId: number) {
 
 // ─── 图片验证码生成 ───────────────────────────────────────────────────────────
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _canvas: any = null;
-let _canvasInstalling = false;
 
 async function tryGetCanvas(): Promise<any> {
   if (_canvas !== null) return _canvas;
-
   try {
     _canvas = await import("canvas");
-    log(LogLevel.INFO, "canvas module loaded");
+    logger.info("canvas module loaded");
     return _canvas;
-  } catch {}
-
-  if (_canvasInstalling) {
-    const deadline = Date.now() + 60_000;
-    while (_canvasInstalling && Date.now() < deadline) {
-      if (!(await generationDelay(500))) return false;
-    }
-    return _canvas ?? false;
+  } catch {
+    /* canvas not available at build time */
+    throw new Error("canvas not installed at build time");
   }
-
-  _canvasInstalling = true;
-  log(LogLevel.INFO, "canvas not found — auto installing (npm install canvas)…");
-
-  try {
-    execSync("npm install canvas", { stdio: "pipe" });
-    log(LogLevel.INFO, "canvas installed successfully");
-  } catch (e) {
-    log(LogLevel.ERROR, "canvas install failed", e);
-    _canvas = false;
-    _canvasInstalling = false;
-    return false;
-  }
-
-  try {
-    const canvasId = require.resolve("canvas");
-    if (require.cache[canvasId]) delete require.cache[canvasId];
-  } catch {}
-
-  try {
-    _canvas = await import("canvas");
-    log(LogLevel.INFO, "canvas dynamically loaded after install");
-  } catch (e) {
-    log(LogLevel.ERROR, "canvas load failed after install", e);
-    _canvas = false;
-  }
-
-  _canvasInstalling = false;
-  return _canvas ?? false;
 }
 
 async function generateImageCaptcha(
@@ -747,7 +702,7 @@ async function cleanupCaptchaMessages(client: TelegramClient, userId: number, st
   if (!isStateCurrent(state)) return;
   for (const id of state.msgIds) {
     if (!isStateCurrent(state)) return;
-    try { await client.deleteMessages(peerTarget(userId), [id], { revoke: false }); } catch {}
+    try { await client.deleteMessages(peerTarget(userId), [id], { revoke: false }); } catch { /* message already deleted, ignore */ }
   }
 }
 
@@ -833,7 +788,7 @@ async function refreshActiveCaptchas(client: TelegramClient): Promise<void> {
         }
       }
     } catch (e) {
-      log(LogLevel.WARN, `refreshActiveCaptchas: failed to update msg for ${userId}`, e);
+      logger.warn( `refreshActiveCaptchas: failed to update msg for ${userId}`, e);
     }
   }
 }
@@ -978,10 +933,10 @@ async function sendCaptcha(client: TelegramClient, userId: number): Promise<void
         const img = await generateImageCaptcha(digitOnly);
 
         if (!img) {
-          log(LogLevel.WARN, `canvas unavailable for user ${userId}`);
+          logger.warn( `canvas unavailable for user ${userId}`);
           try {
             await client.sendMessage(peerTarget(userId), { message: "❌ 验证服务暂时不可用，请稍后再试。" });
-          } catch {}
+          } catch { /* send failed, ignore */ }
           return;
         }
 
@@ -1008,7 +963,7 @@ async function sendCaptcha(client: TelegramClient, userId: number): Promise<void
     }
 
     if (!answer) {
-      log(LogLevel.WARN, `sendCaptcha: answer empty (mode=${mode}), fallback to MATH`);
+      logger.warn( `sendCaptcha: answer empty (mode=${mode}), fallback to MATH`);
       const { question: q, answer: ans } = mathQuestion();
       answer   = ans;
       question = q;
@@ -1030,7 +985,7 @@ async function sendCaptcha(client: TelegramClient, userId: number): Promise<void
           const st = states.get(userId);
           if (st !== state) return;
           removeCaptchaState(userId);
-          log(LogLevel.INFO, `Captcha timed out: ${userId}`);
+          logger.info( `Captcha timed out: ${userId}`);
           const name = await getDisplayName(client, userId).catch(() => String(userId));
           if (!isStateCurrent(state)) return;
           rec.addFailed(userId, name, "timeout", usernameCache.get(userId));
@@ -1039,20 +994,20 @@ async function sendCaptcha(client: TelegramClient, userId: number): Promise<void
           if (!isStateCurrent(state)) return;
           try {
             await client.sendMessage(peerTarget(userId), { message: "⏰ 验证超时，对话已被限制。", parseMode: "html" });
-          } catch {}
+          } catch { /* send failed, ignore */ }
           if (!isStateCurrent(state)) return;
           await runFailActions(client, userId);
         }, { label: `pmcaptcha-timeout:${userId}` }).catch((error) => {
-          log(LogLevel.ERROR, `Captcha timeout task failed: ${userId}`, error);
+          logger.error( `Captcha timeout task failed: ${userId}`, error);
         });
       }, timeout * 1000, { label: `pmcaptcha-timer:${userId}` });
     }
 
     states.set(userId, state);
-    log(LogLevel.INFO, `Captcha sent (${mode}, timeout=${timeout}s) → user ${userId}`);
+    logger.info( `Captcha sent (${mode}, timeout=${timeout}s) → user ${userId}`);
 
   } catch (e) {
-    log(LogLevel.ERROR, `Failed to send captcha to ${userId}`, e);
+    logger.error( `Failed to send captcha to ${userId}`, e);
   }
 }
 
@@ -1081,10 +1036,10 @@ async function handleReply(client: TelegramClient, userId: number, input: string
   if (incomingMsgId) state.msgIds.push(incomingMsgId);
 
   if (!state.answer) {
-    log(LogLevel.WARN, `handleReply: empty answer for user ${userId}`);
+    logger.warn( `handleReply: empty answer for user ${userId}`);
     removeCaptchaState(userId);
     await cleanupCaptchaMessages(client, userId, state);
-    try { await client.sendMessage(peerTarget(userId), { message: "❌ 验证状态异常，请联系对方重置。", parseMode: "html" }); } catch {}
+    try { await client.sendMessage(peerTarget(userId), { message: "❌ 验证状态异常，请联系对方重置。", parseMode: "html" }); } catch { /* send failed, ignore */ }
     return;
   }
 
@@ -1103,12 +1058,12 @@ async function handleReply(client: TelegramClient, userId: number, input: string
     if (!isStateCurrent(state)) return;
     rec.addVerified(userId, name, usernameCache.get(userId));
     rec.delFailed(userId);
-    log(LogLevel.INFO, `User ${userId} passed captcha`);
+    logger.info( `User ${userId} passed captcha`);
     await runPassActions(client, userId);
     if (!isStateCurrent(state)) return;
     try {
       await client.sendMessage(peerTarget(userId), { message: "✅ 验证通过！欢迎与我对话。", parseMode: "html" });
-    } catch {}
+    } catch { /* send failed, ignore */ }
     return;
   }
 
@@ -1123,10 +1078,10 @@ async function handleReply(client: TelegramClient, userId: number, input: string
     if (!isStateCurrent(state)) return;
     rec.addFailed(userId, name, "max_tries", usernameCache.get(userId));
     rec.delVerified(userId);
-    log(LogLevel.INFO, `User ${userId} failed captcha (max tries)`);
+    logger.info( `User ${userId} failed captcha (max tries)`);
     try {
       await client.sendMessage(peerTarget(userId), { message: "❌ 验证失败次数过多，对话已被限制。", parseMode: "html" });
-    } catch {}
+    } catch { /* send failed, ignore */ }
     if (!isStateCurrent(state)) return;
     await runFailActions(client, userId);
   } else {
@@ -1135,7 +1090,7 @@ async function handleReply(client: TelegramClient, userId: number, input: string
       const hintMsg = await client.sendMessage(peerTarget(userId), { message: `❌ 答案错误，${htmlEscape(hint)}`, parseMode: "html" });
       if (!isStateCurrent(state)) return;
       state.msgIds.push(hintMsg.id);
-    } catch {}
+    } catch { /* send failed, ignore */ }
   }
 }
 
@@ -1168,11 +1123,11 @@ async function checkChatHistory(client: TelegramClient, userId: number, currentM
     }
     if (count >= threshold) {
       wl.add(userId);
-      log(LogLevel.INFO, `Auto-pass user ${userId} by chat_history (${count} >= ${threshold})`);
+      logger.info( `Auto-pass user ${userId} by chat_history (${count} >= ${threshold})`);
       return "pass";
     }
   } catch (e) {
-    log(LogLevel.WARN, `checkChatHistory failed for ${userId}`, e);
+    logger.warn( `checkChatHistory failed for ${userId}`, e);
   }
   return "skip";
 }
@@ -1192,11 +1147,11 @@ async function checkGroupsInCommon(client: TelegramClient, userId: number): Prom
     const commonChatsCount = result?.fullUser?.commonChatsCount ?? 0;
     if (commonChatsCount >= threshold) {
       wl.add(userId);
-      log(LogLevel.INFO, `Auto-pass user ${userId} by groups_in_common (${commonChatsCount} >= ${threshold})`);
+      logger.info( `Auto-pass user ${userId} by groups_in_common (${commonChatsCount} >= ${threshold})`);
       return "pass";
     }
   } catch (e) {
-    log(LogLevel.WARN, `checkGroupsInCommon failed for ${userId}`, e);
+    logger.warn( `checkGroupsInCommon failed for ${userId}`, e);
   }
   return "skip";
 }
@@ -1216,7 +1171,7 @@ async function checkWordFilter(client: TelegramClient, userId: number, message: 
     for (const word of wlWords) {
       if (text.includes(word)) {
         wl.add(userId);
-        log(LogLevel.INFO, `Auto-pass user ${userId} by whitelist word: "${word}"`);
+        logger.info( `Auto-pass user ${userId} by whitelist word: "${word}"`);
         return "pass";
       }
     }
@@ -1227,7 +1182,7 @@ async function checkWordFilter(client: TelegramClient, userId: number, message: 
   if (blWords.length > 0) {
     for (const word of blWords) {
       if (text.includes(word)) {
-        log(LogLevel.INFO, `Auto-block user ${userId} by blacklist word: "${word}"`);
+        logger.info( `Auto-block user ${userId} by blacklist word: "${word}"`);
         return "block";
       }
     }
@@ -1259,7 +1214,7 @@ async function checkPremium(client: TelegramClient, userId: number, message: Api
       ) as any;
       isPremium = !!(result?.users?.[0]?.premium);
     } catch (e) {
-      log(LogLevel.WARN, `checkPremium: cannot get premium status for ${userId}`, e);
+      logger.warn( `checkPremium: cannot get premium status for ${userId}`, e);
       return "skip";
     }
   }
@@ -1268,25 +1223,25 @@ async function checkPremium(client: TelegramClient, userId: number, message: Api
     case "allow":
       if (isPremium) {
         wl.add(userId);
-        log(LogLevel.INFO, `Auto-pass Premium user ${userId} (strategy=allow)`);
+        logger.info( `Auto-pass Premium user ${userId} (strategy=allow)`);
         return "pass";
       }
       return "skip";
 
     case "ban":
       if (isPremium) {
-        log(LogLevel.INFO, `Auto-block Premium user ${userId} (strategy=ban)`);
+        logger.info( `Auto-block Premium user ${userId} (strategy=ban)`);
         return "block";
       }
       return "skip";
 
     case "only":
       if (!isPremium) {
-        log(LogLevel.INFO, `Auto-block non-Premium user ${userId} (strategy=only)`);
+        logger.info( `Auto-block non-Premium user ${userId} (strategy=only)`);
         return "block";
       }
       wl.add(userId);
-      log(LogLevel.INFO, `Auto-pass Premium user ${userId} (strategy=only)`);
+      logger.info( `Auto-pass Premium user ${userId} (strategy=only)`);
       return "pass";
 
     default:
@@ -1349,21 +1304,21 @@ async function executeBlockActions(client: TelegramClient, userId: number) {
     for (const action of actions) {
       switch (action) {
         case FailAction.BLOCK:
-          try { await client.invoke(new Api.contacts.Block({ id: peerTarget(userId) })); } catch {}
+          try { await client.invoke(new Api.contacts.Block({ id: peerTarget(userId) })); } catch { /* block failed, ignore */ }
           break;
         case FailAction.REPORT:
-          try { await client.invoke(new Api.account.ReportPeer({ peer: peerTarget(userId), reason: new Api.InputReportReasonSpam(), message: "" })); } catch {}
+          try { await client.invoke(new Api.account.ReportPeer({ peer: peerTarget(userId), reason: new Api.InputReportReasonSpam(), message: "" })); } catch { /* report failed, ignore */ }
           break;
         case FailAction.DELETE:
-          try { await client.invoke(new Api.messages.DeleteHistory({ peer: peerTarget(userId), maxId: 0, justClear: false, revoke: true })); } catch {}
+          try { await client.invoke(new Api.messages.DeleteHistory({ peer: peerTarget(userId), maxId: 0, justClear: false, revoke: true })); } catch { /* delete failed, ignore */ }
           break;
       }
     }
     const name = await getDisplayName(client, userId).catch(() => String(userId));
     rec.addFailed(userId, name, "max_tries", usernameCache.get(userId));
-    log(LogLevel.INFO, `Auto-block actions executed for user ${userId}`);
+    logger.info( `Auto-block actions executed for user ${userId}`);
   } catch (e) {
-    log(LogLevel.ERROR, `executeBlockActions failed for ${userId}`, e);
+    logger.error( `executeBlockActions failed for ${userId}`, e);
   }
 }
 
@@ -1381,7 +1336,7 @@ async function messageListener(message: Api.Message) {
     const TELEGRAM_OFFICIAL_IDS = [777000];   // 官方账号 ID 列表（可扩展）
     const senderId = Number(message.senderId);
     if (TELEGRAM_OFFICIAL_IDS.includes(senderId)) {
-      log(LogLevel.INFO, `Skipping Telegram official service ID ${senderId}`);
+      logger.info( `Skipping Telegram official service ID ${senderId}`);
       return;
     }
     // ─────────────────────────────────────────────────
@@ -1393,11 +1348,11 @@ async function messageListener(message: Api.Message) {
       if (targetId > 0 && targetId !== selfId) {
         // 同样跳过官方账号的自动标记
         if (TELEGRAM_OFFICIAL_IDS.includes(targetId)) {
-          log(LogLevel.INFO, `Not auto-verifying official service ID ${targetId}`);
+          logger.info( `Not auto-verifying official service ID ${targetId}`);
           return;
         }
         if (states.has(targetId)) {
-          log(LogLevel.INFO, `Skip auto-verify ${targetId}: captcha pending`);
+          logger.info( `Skip auto-verify ${targetId}: captcha pending`);
           return;
         }
         const alreadyVerified = cfg.verified().some(r => r.id === targetId);
@@ -1406,7 +1361,7 @@ async function messageListener(message: Api.Message) {
           if (sender) cacheUserFromSender(sender);
           const name = await getDisplayName(client, targetId).catch(() => String(targetId));
           rec.addVerified(targetId, name, usernameCache.get(targetId));
-          log(LogLevel.INFO, `Auto-verified ${targetId} (we initiated chat)`);
+          logger.info( `Auto-verified ${targetId} (we initiated chat)`);
         }
       }
       return;
@@ -1423,7 +1378,7 @@ async function messageListener(message: Api.Message) {
 
     let sender = (message as any).sender ?? (message as any)._sender;
     if (!sender) {
-      try { sender = await (message as any).getSender?.(); } catch {}
+      try { sender = await (message as any).getSender?.(); } catch { /* getSender failed, ignore */ }
     }
     if (sender) cacheUserFromSender(sender);
     await cachePeerFromMessage(message, userId);
@@ -1449,7 +1404,7 @@ async function messageListener(message: Api.Message) {
       await sendCaptcha(client, userId);
     }
   } catch (e) {
-    log(LogLevel.ERROR, "Listener error", e);
+    logger.error( "Listener error", e);
   }
 }
 
@@ -1706,11 +1661,11 @@ const pmcaptcha = async (message: Api.Message) => {
           : `🚫 <b>PMCaptcha 已禁用</b>\n验证配置已保留，下次启用后自动恢复`,
         parseMode: "html"
       });
-      try { await message.delete(); } catch {}
+      try { await message.delete(); } catch { /* delete failed, ignore */ }
       getActiveLifecycle()?.setTimeout(() => {
         void tmp.delete().catch(() => undefined);
       }, 3000, { label: "pmcaptcha-command-cleanup" });
-    } catch (e) { log(LogLevel.ERROR, "pmc on/off error", e); }
+    } catch (e) { logger.error( "pmc on/off error", e); }
     return;
   }
 
@@ -1724,7 +1679,7 @@ const pmcaptcha = async (message: Api.Message) => {
       });
     } catch (e: any) {
       if (String(e).includes("Could not find the input entity")) {
-        try { await message.reply({ message: text, parseMode: "html", linkPreview: false }); } catch {}
+        try { await message.reply({ message: text, parseMode: "html", linkPreview: false }); } catch { /* reply failed, ignore */ }
       } else {
         throw e;
       }
@@ -2176,7 +2131,7 @@ const pmcaptcha = async (message: Api.Message) => {
           try {
             const r = await safeGetMessages(client, message.peerId, { ids: [message.replyTo.replyToMsgId] });
             if (r[0]?.senderId) tid = Number(r[0].senderId);
-          } catch {}
+          } catch { /* getMessages failed, ignore */ }
         }
         if (!tid && args[1]) tid = await resolveUser(client, args[1]);
         if (!tid || tid <= 0) {
@@ -2237,7 +2192,7 @@ const pmcaptcha = async (message: Api.Message) => {
             try {
               const r = await safeGetMessages(client, message.peerId, { ids: [message.replyTo.replyToMsgId] });
               if (r[0]?.senderId) tid = Number(r[0].senderId);
-            } catch {}
+            } catch { /* getMessages failed, ignore */ }
           }
           if (!tid && args[2]) tid = await resolveUser(client, args[2]);
           if (!tid || tid <= 0) { await edit("❌ 请提供有效的用户 ID / 用户名，或回复用户消息"); break; }
@@ -2413,8 +2368,8 @@ const pmcaptcha = async (message: Api.Message) => {
         );
     }
   } catch (e) {
-    log(LogLevel.ERROR, "Command error", e);
-    try { await edit(`❌ 命令执行失败: ${htmlEscape(e)}`); } catch {}
+    logger.error( "Command error", e);
+    try { await edit(`❌ 命令执行失败: ${htmlEscape(e)}`); } catch { /* edit failed, ignore */ }
   }
 };
 
@@ -2488,86 +2443,6 @@ class PMCaptchaPlugin extends Plugin {
   };
   cmdHandlers = { pmc, pmcaptcha };
   listenMessageHandler = messageListener;
-
-  // Panel Settings Adapter
-  panelAdapter: PanelSettingsAdapter = {
-    id: "pmcaptcha",
-    title: "私聊验证",
-    description: "私聊验证码配置",
-    category: "插件配置",
-    icon: "🛡️",
-    getSchema: (): PanelSettingField[] => [
-      {
-            "key": "plugin_enabled",
-            "label": "启用插件",
-            "type": "boolean"
-      },
-      {
-            "key": "captcha_enabled",
-            "label": "启用验证码",
-            "type": "boolean"
-      },
-      {
-            "key": "captcha_mode",
-            "label": "验证码模式",
-            "type": "select",
-            "options": [
-                  {
-                        "value": "math",
-                        "label": "数学计算"
-                  },
-                  {
-                        "value": "text",
-                        "label": "文字关键词"
-                  },
-                  {
-                        "value": "img_digit",
-                        "label": "图片数字"
-                  },
-                  {
-                        "value": "img_mixed",
-                        "label": "图片字母数字混合"
-                  }
-            ]
-      },
-      {
-            "key": "captcha_timeout",
-            "label": "验证超时 (秒)",
-            "type": "number",
-            "min": 10,
-            "max": 300,
-            "default": 30
-      },
-      {
-            "key": "captcha_max_tries",
-            "label": "最大尝试次数",
-            "type": "number",
-            "min": 1,
-            "max": 10,
-            "default": 3
-      },
-      {
-            "key": "captcha_text_keyword",
-            "label": "文字验证关键词",
-            "type": "string",
-            "default": "我同意"
-      },
-      {
-            "key": "captcha_prompt",
-            "label": "自定义提示",
-            "type": "textarea"
-      }
-],
-    getValues: async (): Promise<Record<string, unknown>> => {
-      const db = await JSONFilePreset<any>(path.join(createDirectoryInAssets("pmcaptcha"), "config.json"), DEFAULT_CONFIG);
-      return db.data as Record<string, unknown>;
-    },
-    setValues: async (patch: Record<string, unknown>): Promise<void> => {
-      const db = await JSONFilePreset<any>(path.join(createDirectoryInAssets("pmcaptcha"), "config.json"), DEFAULT_CONFIG);
-      Object.assign(db.data, patch);
-      await db.write();
-    },
-  };
 }
 
 const plugin = new PMCaptchaPlugin();
