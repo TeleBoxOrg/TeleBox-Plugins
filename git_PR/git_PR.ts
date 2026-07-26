@@ -185,6 +185,7 @@ class GitManagerPlugin extends Plugin {
         await msg.edit({ text: `❌ <b>操作失败:</b> ${htmlEscape(error.message)}`, parseMode: "html" });
       }
     },
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "git_PR",
@@ -225,7 +226,6 @@ class GitManagerPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 
   private async handleLogin(msg: Api.Message, args: string[]) {

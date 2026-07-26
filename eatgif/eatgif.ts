@@ -17,6 +17,7 @@ import { promisify } from "util";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
 
 import { htmlEscape } from "@utils/htmlEscape";
+import { JSONFilePreset } from "lowdb/node";
 
 const execFileAsync = promisify(execFile);
 
@@ -156,6 +157,63 @@ class EatGifPlugin extends Plugin {
       await this.handleEatGif(msg, trigger);
     },
     // eatgif2
+  };
+  // Panel Settings Adapter
+  panelAdapter: PanelSettingsAdapter = {
+    id: "eatgif",
+    title: "吃 GIF",
+    description: "吃 GIF 动图配置",
+    category: "插件配置",
+    icon: "🎬",
+    getSchema: (): PanelSettingField[] => [
+      {
+            "key": "x",
+            "label": "X 坐标偏移",
+            "type": "number",
+            "min": -100,
+            "max": 100,
+            "default": 0
+      },
+      {
+            "key": "y",
+            "label": "Y 坐标偏移",
+            "type": "number",
+            "min": -100,
+            "max": 100,
+            "default": 0
+      },
+      {
+            "key": "mask",
+            "label": "遮罩形状",
+            "type": "string",
+            "default": "circle"
+      },
+      {
+            "key": "rotate",
+            "label": "旋转角度",
+            "type": "number",
+            "min": -360,
+            "max": 360,
+            "default": 0
+      },
+      {
+            "key": "brightness",
+            "label": "亮度",
+            "type": "number",
+            "min": 0,
+            "max": 200,
+            "default": 100
+      }
+],
+    getValues: async (): Promise<Record<string, unknown>> => {
+      const db = await JSONFilePreset<RoleConfig>(path.join(createDirectoryInAssets("eatgif"), "config.json"), {} as any);
+      return db.data as Record<string, unknown>;
+    },
+    setValues: async (patch: Record<string, unknown>): Promise<void> => {
+      const db = await JSONFilePreset<RoleConfig>(path.join(createDirectoryInAssets("eatgif"), "config.json"), {} as any);
+      Object.assign(db.data, patch);
+      await db.write();
+    },
   };
 
   private async handleEatGif(msg: Api.Message, trigger?: Api.Message) {
@@ -397,63 +455,6 @@ class EatGifPlugin extends Plugin {
       input: iconMasked,
       top: role.y,
       left: role.x,
-  // Panel Settings Adapter
-  panelAdapter: PanelSettingsAdapter = {
-    id: "eatgif",
-    title: "吃 GIF",
-    description: "吃 GIF 动图配置",
-    category: "插件配置",
-    icon: "🎬",
-    getSchema: (): PanelSettingField[] => [
-      {
-            "key": "x",
-            "label": "X 坐标偏移",
-            "type": "number",
-            "min": -100,
-            "max": 100,
-            "default": 0
-      },
-      {
-            "key": "y",
-            "label": "Y 坐标偏移",
-            "type": "number",
-            "min": -100,
-            "max": 100,
-            "default": 0
-      },
-      {
-            "key": "mask",
-            "label": "遮罩形状",
-            "type": "string",
-            "default": "circle"
-      },
-      {
-            "key": "rotate",
-            "label": "旋转角度",
-            "type": "number",
-            "min": -360,
-            "max": 360,
-            "default": 0
-      },
-      {
-            "key": "brightness",
-            "label": "亮度",
-            "type": "number",
-            "min": 0,
-            "max": 200,
-            "default": 100
-      }
-],
-    getValues: async (): Promise<Record<string, unknown>> => {
-      const db = await JSONFilePreset<RoleConfig>(path.join(createDirectoryInAssets("eatgif"), "config.json"), {} as any);
-      return db.data as Record<string, unknown>;
-    },
-    setValues: async (patch: Record<string, unknown>): Promise<void> => {
-      const db = await JSONFilePreset<RoleConfig>(path.join(createDirectoryInAssets("eatgif"), "config.json"), {} as any);
-      Object.assign(db.data, patch);
-      await db.write();
-    },
-  };
     };
   }
   // 获取头像等数据

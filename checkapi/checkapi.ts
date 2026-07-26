@@ -1,4 +1,5 @@
 import { Plugin, type PanelSettingsAdapter, type PanelSettingField } from "@utils/pluginBase"; import { getPrefixes } from "@utils/pluginManager"; import { Api } from "teleproto"; import * as fs from "fs/promises"; import path from "path"; import axios from "axios"; import { createDirectoryInAssets } from "@utils/pathHelpers";  
+import { JSONFilePreset } from "lowdb/node";
 
 const pfx = getPrefixes(); const mp = pfx[0];
 const DD = createDirectoryInAssets("checkapi"); const KF = path.join(DD, "keys.json");
@@ -344,7 +345,7 @@ async function validateKey(provider:string,key:string,baseUrl:string): Promise<s
 
 // ── Plugin ──
 class CheckApiPlugin extends Plugin{name="checkapi";description=
-`🔍 API 检测 v6\n\n传入 URL + Key 即可自动识别、查余额、测速。\n所有子命令均支持直接传入网址和密钥，无需预先保存。\n\n用法：\n<blockquote expandable><code>${mp
+`🔍 API 检测 v6\n\n传入 URL + Key 即可自动识别、查余额、测速。\n所有子命令均支持直接传入网址和密钥，无需预先保存。\n\n用法：\n<blockquote expandable><code>${mp}checkapi &lt;URL&gt; &lt;key&gt;</code> — 一键检测全部\n<code>${mp}checkapi models &lt;URL&gt; &lt;key&gt;</code> — 查看模型列表\n<code>${mp}checkapi speed &lt;URL&gt; &lt;key&gt;</code> — 测试响应速度\n<code>${mp}checkapi ask &lt;URL&gt; &lt;key&gt; &lt;问题&gt;</code> — 发送对话\n<code>${mp}checkapi compare &lt;k1&gt; &lt;k2&gt;</code> — 对比两个 API\n<code>${mp}checkapi save/list/del/check</code> — 管理已保存的密钥</blockquote>\n支持 curl 命令 / 环境变量 / JSON 配置直接粘贴`;
     // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
         id: "checkapi",
@@ -380,7 +381,6 @@ class CheckApiPlugin extends Plugin{name="checkapi";description=
           await db.write();
         },
       };
-}checkapi &lt;URL&gt; &lt;key&gt;</code> — 一键检测全部\n<code>${mp}checkapi models &lt;URL&gt; &lt;key&gt;</code> — 查看模型列表\n<code>${mp}checkapi speed &lt;URL&gt; &lt;key&gt;</code> — 测试响应速度\n<code>${mp}checkapi ask &lt;URL&gt; &lt;key&gt; &lt;问题&gt;</code> — 发送对话\n<code>${mp}checkapi compare &lt;k1&gt; &lt;k2&gt;</code> — 对比两个 API\n<code>${mp}checkapi save/list/del/check</code> — 管理已保存的密钥</blockquote>\n支持 curl 命令 / 环境变量 / JSON 配置直接粘贴`;
 
 cmdHandlers:Record<string,(msg:Api.Message)=>Promise<void>>={checkapi:async(msg)=>{
   const rawFull=msg.message.slice(mp.length).trim();

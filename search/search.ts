@@ -724,6 +724,7 @@ class ChannelSearchPlugin extends Plugin {
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     so,
     search: so,
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "search",
@@ -767,7 +768,6 @@ class ChannelSearchPlugin extends Plugin {
       await fs.mkdir(path.dirname(CONFIG_FILE_PATH), { recursive: true });
       await fs.writeFile(CONFIG_FILE_PATH, JSON.stringify(config, null, 2));
     },
-  };
   };
 }
 

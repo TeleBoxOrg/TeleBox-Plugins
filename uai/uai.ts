@@ -633,9 +633,11 @@ class UAIPlugin extends Plugin {
             } catch (err: any) {
                 await msg.edit({ text: `❌ 错误: ${htmlEscape(err.message || String(err))}`, parseMode: "html" });
             }
-        }
-  // Panel Settings Adapter
-  panelAdapter: PanelSettingsAdapter = {
+        },
+    };
+
+    // Panel Settings Adapter
+    panelAdapter: PanelSettingsAdapter = {
     id: "uai",
     title: "UAI 对话",
     description: "UAI 对话配置：提供者、预设提示词、超时",
@@ -672,7 +674,6 @@ class UAIPlugin extends Plugin {
       await db.write();
     },
   };
-    };
 }
 
 export default new UAIPlugin();

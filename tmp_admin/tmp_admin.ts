@@ -850,6 +850,7 @@ class TmpAdminPlugin extends Plugin {
     const baseOptions = {
       message,
       parseMode: "html" as const,
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "tmp_admin",
@@ -874,7 +875,6 @@ class TmpAdminPlugin extends Plugin {
       await db.write();
     },
   };
-    };
 
     try {
       await job.client.sendMessage(job.peerId, {

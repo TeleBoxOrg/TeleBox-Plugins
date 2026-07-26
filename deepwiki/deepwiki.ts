@@ -994,6 +994,7 @@ class DeepWikiPlugin extends Plugin {
         await MessageSender.sendOrEdit(original, this.formatError(err), "html");
       }
     },
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "deepwiki",
@@ -1028,7 +1029,6 @@ class DeepWikiPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 
   async onUnload(): Promise<void> {

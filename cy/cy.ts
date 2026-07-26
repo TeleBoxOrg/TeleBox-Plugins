@@ -7,6 +7,7 @@ import { CustomFile } from "teleproto/client/uploads";
 import { createCanvas, registerFont } from "canvas";
 import fs from "fs";
 import path from "path";
+import { JSONFilePreset } from "lowdb/node";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0] || ".";
@@ -500,6 +501,7 @@ class CyPlugin extends Plugin {
       }
       await msg.safeDelete?.({ revoke: true } as any);
     },
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "cy",
@@ -541,7 +543,6 @@ class CyPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 

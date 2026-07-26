@@ -88,6 +88,10 @@ class PicToStickerPlugin extends Plugin {
       background: 'transparent',
       autoDelete: true,
       compressionLevel: 6
+    };
+    this.loadConfig();
+  }
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "pic_to_sticker",
@@ -163,9 +167,6 @@ class PicToStickerPlugin extends Plugin {
       await db.write();
     },
   };
-    };
-    this.loadConfig();
-  }
 
   private async loadConfig() {
     try {

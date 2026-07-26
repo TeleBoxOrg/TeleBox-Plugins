@@ -329,7 +329,9 @@ class SSHPlugin extends Plugin {
   cmdHandlers = {
     ssh: async (msg: Api.Message) => {
       await this.handleSSH(msg);
-    }
+    },
+  };
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "ssh",
@@ -392,7 +394,6 @@ class SSHPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 
   // 主命令处理器

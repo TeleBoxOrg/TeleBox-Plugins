@@ -14,6 +14,7 @@ import {
   createDirectoryInAssets,
   createDirectoryInTemp,
 } from "@utils/pathHelpers";
+import { JSONFilePreset } from "lowdb/node";
 
 // --- Global variables for test control ---
 let DEFAULT_TIMEOUT = 300000; // Default 5 minutes, can be customized
@@ -1027,6 +1028,7 @@ class SpeedlinkPlugin extends Plugin {
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     speedlink: speedtest,
     sl: speedtest,
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "speedlink",
@@ -1089,7 +1091,6 @@ class SpeedlinkPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 

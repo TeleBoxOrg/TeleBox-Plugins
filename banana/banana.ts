@@ -503,6 +503,8 @@ class BananaPlugin extends Plugin {
   description: string = `Nano-Banana 图像编辑插件\n\n${help_text}`;
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     banana: handleBananaCommand,
+  };
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "banana",
@@ -535,7 +537,6 @@ class BananaPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 

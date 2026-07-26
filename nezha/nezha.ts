@@ -9,6 +9,7 @@ import * as yaml from "js-yaml";
 import { createDirectoryInAssets, createDirectoryInTemp } from "@utils/pathHelpers";
 
 import { htmlEscape } from "@utils/htmlEscape";
+import { JSONFilePreset } from "lowdb/node";
 
 interface NeZhaConfig {
   url: string;
@@ -793,6 +794,7 @@ class NeZhaPlugin extends Plugin {
   `;
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     nezha,
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "nezha",
@@ -832,7 +834,6 @@ class NeZhaPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 

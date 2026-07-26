@@ -45,33 +45,6 @@ type EntityFields = {
   firstName?: string;
   lastName?: string;
   className?: string;
-  // Panel Settings Adapter
-  panelAdapter: PanelSettingsAdapter = {
-    id: "fbi",
-    title: "FBI 跨群追踪",
-    description: "跨群组消息追踪配置",
-    category: "插件配置",
-    icon: "🕵️",
-    getSchema: (): PanelSettingField[] => [
-      {
-            "key": "cacheLimit",
-            "label": "缓存限制 (条)",
-            "type": "number",
-            "min": 100,
-            "max": 10000,
-            "default": 1000
-      }
-],
-    getValues: async (): Promise<Record<string, unknown>> => {
-      const db = await JSONFilePreset<FbiConfig>(path.join(createDirectoryInAssets("fbi"), "config.json"), CONFIG_DEF);
-      return db.data as Record<string, unknown>;
-    },
-    setValues: async (patch: Record<string, unknown>): Promise<void> => {
-      const db = await JSONFilePreset<FbiConfig>(path.join(createDirectoryInAssets("fbi"), "config.json"), CONFIG_DEF);
-      Object.assign(db.data, patch);
-      await db.write();
-    },
-  };
 };
 const entityFields = (e: unknown): EntityFields => e as EntityFields;
 
@@ -124,6 +97,33 @@ class FbiPlugin extends Plugin {
   description = `FBI 跨群组追踪\n\n${HELP}`;
 
   cmdHandlers = { fbi: this.onCmd.bind(this) };
+  // Panel Settings Adapter
+  panelAdapter: PanelSettingsAdapter = {
+    id: "fbi",
+    title: "FBI 跨群追踪",
+    description: "跨群组消息追踪配置",
+    category: "插件配置",
+    icon: "🕵️",
+    getSchema: (): PanelSettingField[] => [
+      {
+            "key": "cacheLimit",
+            "label": "缓存限制 (条)",
+            "type": "number",
+            "min": 100,
+            "max": 10000,
+            "default": 1000
+      }
+],
+    getValues: async (): Promise<Record<string, unknown>> => {
+      const db = await JSONFilePreset<FbiConfig>(path.join(createDirectoryInAssets("fbi"), "config.json"), CONFIG_DEF);
+      return db.data as Record<string, unknown>;
+    },
+    setValues: async (patch: Record<string, unknown>): Promise<void> => {
+      const db = await JSONFilePreset<FbiConfig>(path.join(createDirectoryInAssets("fbi"), "config.json"), CONFIG_DEF);
+      Object.assign(db.data, patch);
+      await db.write();
+    },
+  };
   listenMessageHandler = this.onMsg.bind(this);
 
   private configDb: any;

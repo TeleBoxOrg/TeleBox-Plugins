@@ -441,7 +441,9 @@ seconds, minutes, hours, date, times`;
   cmdHandlers = {
     sendat: async (msg: Api.Message) => {
       await this.handleSendAtCommand(msg);
-    }
+    },
+  };
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "sendat",
@@ -471,7 +473,6 @@ seconds, minutes, hours, date, times`;
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 
   cleanup(): void {

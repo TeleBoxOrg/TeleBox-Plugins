@@ -20,6 +20,7 @@ import sharp from "sharp";
 import { getPrefixes } from "@utils/pluginManager";
 
 import { htmlEscape } from "@utils/htmlEscape";
+import { JSONFilePreset } from "lowdb/node";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
@@ -1508,6 +1509,8 @@ class SpeednextPlugin extends Plugin {
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     speedtest,
     st: speedtest,
+  };
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "speedtest",
@@ -1546,7 +1549,6 @@ class SpeednextPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 

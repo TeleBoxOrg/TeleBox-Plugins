@@ -10,6 +10,7 @@ import { getPrefixes } from "@utils/pluginManager";
 import bigInt from "big-integer";
 
 import { htmlEscape } from "@utils/htmlEscape";
+import { JSONFilePreset } from "lowdb/node";
 
 // Track pending setTimeout handles for safe cleanup on reload
 const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -1750,6 +1751,7 @@ class LotteryPlugin extends Plugin {
   
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     lottery,
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "lottery",
@@ -1792,7 +1794,6 @@ class LotteryPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
   
   listenMessageHandler?: ((msg: Api.Message) => Promise<void>) | undefined =

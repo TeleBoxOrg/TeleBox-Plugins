@@ -34,27 +34,6 @@ class TeletypePlugin extends Plugin {
   cmdHandlers = {
     teletype: this.handleTeletype.bind(this)
   };
-  
-  listenMessageHandler = this.handleAutoTeletype.bind(this);
-  listenMessageHandlerIgnoreEdited = true;
-  
-  constructor() {
-    super();
-    this.initDatabase();
-  }
-  
-  private async initDatabase(): Promise<void> {
-    try {
-      const dbPath = path.join(createDirectoryInAssets(this.PLUGIN_NAME), "config.json");
-      this.db = await JSONFilePreset(dbPath, {
-        autoMode: false,
-        enabledUsers: [] as string[]
-      });
-    } catch (error) {
-      console.error(`[${this.PLUGIN_NAME}] 数据库初始化失败:`, error);
-      this.db = {
-        data: { autoMode: false, enabledUsers: [] },
-        write: async () => {}
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "teletype",
@@ -79,6 +58,27 @@ class TeletypePlugin extends Plugin {
       await db.write();
     },
   };
+  
+  listenMessageHandler = this.handleAutoTeletype.bind(this);
+  listenMessageHandlerIgnoreEdited = true;
+  
+  constructor() {
+    super();
+    this.initDatabase();
+  }
+  
+  private async initDatabase(): Promise<void> {
+    try {
+      const dbPath = path.join(createDirectoryInAssets(this.PLUGIN_NAME), "config.json");
+      this.db = await JSONFilePreset(dbPath, {
+        autoMode: false,
+        enabledUsers: [] as string[]
+      });
+    } catch (error) {
+      console.error(`[${this.PLUGIN_NAME}] 数据库初始化失败:`, error);
+      this.db = {
+        data: { autoMode: false, enabledUsers: [] },
+        write: async () => {}
       };
     }
   }

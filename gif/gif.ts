@@ -9,6 +9,7 @@ import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
+import { JSONFilePreset } from "lowdb/node";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
@@ -513,6 +514,8 @@ class GifStickerPlugin extends Plugin {
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     gif,
+  };
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "gif",
@@ -587,7 +590,6 @@ class GifStickerPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 
   cleanup(): void {

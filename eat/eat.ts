@@ -5,6 +5,9 @@ import { Api } from "teleproto";
 import { CustomFile } from "teleproto/client/uploads";
 import { getPrefixes } from "@utils/pluginManager";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
+import * as path from "path";
+import { createDirectoryInAssets } from "@utils/pathHelpers";
+import { JSONFilePreset } from "lowdb/node";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
@@ -466,6 +469,8 @@ class EatPlugin extends Plugin {
     eat2: async (msg: Api.Message, trigger?: Api.Message) => {
       await fn(msg, trigger, true);
     },
+  };
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "eat",
@@ -522,7 +527,6 @@ class EatPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 

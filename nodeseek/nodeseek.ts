@@ -340,6 +340,7 @@ class NodeSeekPlugin extends Plugin {
         }
       },
     },
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "nodeseek",
@@ -385,7 +386,6 @@ class NodeSeekPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 

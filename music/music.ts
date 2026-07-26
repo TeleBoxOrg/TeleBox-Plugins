@@ -2309,6 +2309,7 @@ ${apiKey ? "✅" : "⚪"} <b>AI搜索:</b> ${apiKey ? "已启用" : "未配置"}
     return {
       title: query,
       artist: "Unknown Artist",
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "music",
@@ -2369,7 +2370,6 @@ ${apiKey ? "✅" : "⚪"} <b>AI搜索:</b> ${apiKey ? "已启用" : "未配置"}
       await db.write();
     },
   };
-    };
   }
 }
 

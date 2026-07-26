@@ -10,6 +10,7 @@ import * as os from "os";
 import * as path from "path";
 import crypto from "crypto";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
+import { JSONFilePreset } from "lowdb/node";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
@@ -551,6 +552,7 @@ echo "后端: http://\$IP:3001/\$SECRET"`;
         await msg.edit({ text: `❌ ${error.message || error}`.slice(0, 3500) });
       }
     },
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "sub",
@@ -580,7 +582,6 @@ echo "后端: http://\$IP:3001/\$SECRET"`;
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 

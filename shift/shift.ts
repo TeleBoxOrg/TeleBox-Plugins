@@ -2076,6 +2076,7 @@ class ShiftPlugin extends Plugin {
         });
       }
     },
+  };
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "shift",
@@ -2106,7 +2107,6 @@ class ShiftPlugin extends Plugin {
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
   listenMessageHandlerIgnoreEdited: boolean = false;
   listenMessageHandler?:
