@@ -10,6 +10,10 @@ import { getPrefixes } from "@utils/pluginManager";
 import bigInt from "big-integer";
 
 import { htmlEscape } from "@utils/htmlEscape";
+import { JSONFilePreset } from "lowdb/node";
+
+// Lottery panel config type
+type LotteryConfig = Record<string, unknown>;
 
 // Track pending setTimeout handles for safe cleanup on reload
 const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -1750,7 +1754,8 @@ class LotteryPlugin extends Plugin {
   
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     lottery,
-  // Panel Settings Adapter
+  };
+
   panelAdapter: PanelSettingsAdapter = {
     id: "lottery",
     title: "抽奖",
@@ -1759,30 +1764,30 @@ class LotteryPlugin extends Plugin {
     icon: "🎰",
     getSchema: (): PanelSettingField[] => [
       {
-            "key": "minUsers",
-            "label": "最少参与人数",
-            "type": "number",
-            "min": 2,
-            "max": 100,
-            "default": 2
+        "key": "minUsers",
+        "label": "最少参与人数",
+        "type": "number",
+        "min": 2,
+        "max": 100,
+        "default": 2
       },
       {
-            "key": "maxUsers",
-            "label": "最多参与人数",
-            "type": "number",
-            "min": 2,
-            "max": 1000,
-            "default": 100
+        "key": "maxUsers",
+        "label": "最多参与人数",
+        "type": "number",
+        "min": 2,
+        "max": 1000,
+        "default": 100
       },
       {
-            "key": "timeout",
-            "label": "等待时间 (秒)",
-            "type": "number",
-            "min": 10,
-            "max": 600,
-            "default": 60
+        "key": "timeout",
+        "label": "等待时间 (秒)",
+        "type": "number",
+        "min": 10,
+        "max": 600,
+        "default": 60
       }
-],
+    ],
     getValues: async (): Promise<Record<string, unknown>> => {
       const db = await JSONFilePreset<LotteryConfig>(path.join(createDirectoryInAssets("lottery"), "config.json"), {} as any);
       return db.data as Record<string, unknown>;
@@ -1793,8 +1798,7 @@ class LotteryPlugin extends Plugin {
       await db.write();
     },
   };
-  };
-  
+
   listenMessageHandler?: ((msg: Api.Message) => Promise<void>) | undefined =
     handleEnhancedLotteryJoin;
 }
