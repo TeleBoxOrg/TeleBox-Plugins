@@ -5,6 +5,9 @@ import { Api } from "teleproto";
 import { CustomFile } from "teleproto/client/uploads";
 import { getPrefixes } from "@utils/pluginManager";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
+import { JSONFilePreset } from "lowdb/node";
+import * as path from "path";
+import { createDirectoryInAssets } from "@utils/pathHelpers";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
@@ -466,6 +469,8 @@ class EatPlugin extends Plugin {
     eat2: async (msg: Api.Message, trigger?: Api.Message) => {
       await fn(msg, trigger, true);
     },
+  };
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "eat",
@@ -515,14 +520,13 @@ class EatPlugin extends Plugin {
 ],
     getValues: async (): Promise<Record<string, unknown>> => {
       const db = await JSONFilePreset<RoleConfig>(path.join(createDirectoryInAssets("eat"), "config.json"), {} as any);
-      return db.data as Record<string, unknown>;
+      return db.data as unknown as Record<string, unknown>;
     },
     setValues: async (patch: Record<string, unknown>): Promise<void> => {
       const db = await JSONFilePreset<RoleConfig>(path.join(createDirectoryInAssets("eat"), "config.json"), {} as any);
       Object.assign(db.data, patch);
       await db.write();
     },
-  };
   };
 }
 
