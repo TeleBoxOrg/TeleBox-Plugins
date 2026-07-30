@@ -1,4 +1,4 @@
-import { Plugin , type PanelSettingsAdapter, type PanelSettingField } from "@utils/pluginBase";
+import { Plugin, type PanelSettingsAdapter, type PanelSettingField } from "@utils/pluginBase";
 import { getGlobalClient } from "@utils/runtimeManager";
 import { getPrefixes } from "@utils/pluginManager";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
@@ -15,6 +15,7 @@ interface SignTarget {
   callbackData?: string;
   buttonText?: string;
   enabled: boolean;
+  lastSignTime?: string;
 }
 
 interface CheckInConfig {
@@ -53,6 +54,12 @@ const DEFAULT_CONFIG: CheckInConfig = {
 
 const SH_TZ = "Asia/Shanghai";
 const PREFIX = getPrefixes()[0] || ".";
+
+function maskSecret(val: string, visibleChars = 4): string {
+  if (!val) return "(未配置)";
+  if (val.length <= visibleChars * 2) return "••••••••";
+  return `${val.slice(0, visibleChars)}••••••${val.slice(-visibleChars)}`;
+}
 
 class ConfigManager {
   private readonly configPath: string;
@@ -96,7 +103,6 @@ class CheckInPlugin extends Plugin {
   private readonly cfg = new ConfigManager();
   private timer: NodeJS.Timeout | null = null;
   private running = false;
-  private todayRunTime: string | null = null;
   private pendingAdds = new Map<string, PendingAdd>();
 
   constructor() {
@@ -138,7 +144,6 @@ class CheckInPlugin extends Plugin {
 
         if (action === "reset") {
           this.cfg.save({ lastRunDate: "", currentRunTime: undefined });
-          this.todayRunTime = null;
           await this.edit(msg, "✅ 已重置每日运行状态，定时任务可再次触发。");
           return;
         }
@@ -196,6 +201,8 @@ class CheckInPlugin extends Plugin {
       parseMode: "html",
       linkPreview: false,
     });
+  };
+
   // Panel Settings Adapter
   panelAdapter: PanelSettingsAdapter = {
     id: "checkin",
@@ -284,7 +291,6 @@ class CheckInPlugin extends Plugin {
       }
     },
   };
-  };
 
   private async handleTargetCommand(action: string, args: string[], msg: Api.Message): Promise<void> {
     const conf = this.cfg.get();
@@ -339,10 +345,11 @@ class CheckInPlugin extends Plugin {
     if (action === "list") {
       if (!conf.targets.length) return void (await this.edit(msg, "📝 当前没有配置签到目标"));
       const enabled = conf.targets.filter((t) => t.enabled).length;
+      const timeRange = conf.runTimeEnd ? `${conf.runTime} ~ ${conf.runTimeEnd}` : conf.runTime;
       const lines = conf.targets
         .map((t, i) => {
           const m = t.callbackData ? `\n   回调: ${this.escape(t.callbackData)}` : t.buttonText ? `\n   按钮: ${this.escape(t.buttonText)}` : "";
-          return `${t.enabled ? "🟢" : "🔴"} <b>${i + 1}. ${this.escape(t.name)}</b>\n   ID: ${this.escape(t.id)}\n   目标: ${this.escape(t.target)}\n   命令: ${this.escape(t.command)}${m}`;
+          return `${t.enabled ? "🟢" : "🔴"} <b>${i + 1}. ${this.escape(t.name)}</b>\n   ID: ${this.escape(t.id)}\n   目标: ${this.escape(t.target)}\n   命令: ${this.escape(t.command)}${m}\n   ⏰ 设定时间段: ${this.escape(timeRange)}\n   ✅ 实际签到: ${this.escape(t.lastSignTime || "尚未签到")}`;
         })
         .join("\n\n");
       await this.edit(msg, `📝 <b>签到目标列表</b> (${enabled}/${conf.targets.length} 个启用)\n\n${lines}`);
@@ -483,38 +490,52 @@ class CheckInPlugin extends Plugin {
     try {
       const conf = this.cfg.get();
       const now = new Date();
-      const today = this.dateCN(now);
-      const t = new Date(now.toLocaleString("en-US", { timeZone: SH_TZ }));
-      
+      const shTime = this.getSHTime(now);
+      const today = shTime.date;
+
+      // 今天已经执行过了
       if (conf.lastRunDate === today) return;
 
-      // 每天重新生成随机时间，避免连续多天使用同一时间
-      this.todayRunTime = null;
-
-      const runTimeToday = this.getTodayRunTime();
-      if (!runTimeToday) {
-        this.todayRunTime = conf.runTime;
-      } else {
-        this.todayRunTime = runTimeToday;
+      // 确定今天的执行时间（优先使用已持久化的时间）
+      let runTime = conf.currentRunTime;
+      if (!runTime) {
+        runTime = this.calculateRunTime();
+        if (runTime) {
+          this.cfg.save({ currentRunTime: runTime });
+        }
       }
+      const todayRunTime = runTime || conf.runTime;
 
-      const [h, m] = this.todayRunTime.split(":").map(Number);
-      
-      if (t.getHours() !== h || t.getMinutes() !== m) return;
+      const [h, m] = todayRunTime.split(":").map(Number);
 
+      // 检查时间范围（如果有）
       if (conf.runTimeEnd) {
+        const [startH, startM] = conf.runTime.split(":").map(Number);
         const [endH, endM] = conf.runTimeEnd.split(":").map(Number);
+        const startMinutes = startH * 60 + startM;
         const endMinutes = endH * 60 + endM;
-        const currentMinutes = t.getHours() * 60 + t.getMinutes();
-        if (currentMinutes > endMinutes) return;
+        const currentMinutes = shTime.hours * 60 + shTime.minutes;
+
+        if (startMinutes <= endMinutes) {
+          // 不跨天，例如 10:00 ~ 11:30
+          if (currentMinutes > endMinutes) return;
+        } else {
+          // 跨天，例如 22:00 ~ 02:00
+          if (currentMinutes > endMinutes && currentMinutes < startMinutes) return;
+        }
       }
+
+      // 时间匹配：当前时间达到或超过目标时刻即触发（避免因轮询错过精确分钟而整天不签到）
+      const targetMinutes = h * 60 + m;
+      const nowMinutes = shTime.hours * 60 + shTime.minutes;
+      if (nowMinutes < targetMinutes) return;
 
       this.running = true;
       if (conf.randomDelay > 0) {
         await this.sleep(Math.floor(Math.random() * conf.randomDelay * 60_000));
       }
       await this.runAllSigns("自动定时任务");
-      this.cfg.save({ lastRunDate: today });
+      this.cfg.save({ lastRunDate: today, currentRunTime: undefined });
     } catch (e) {
       console.error("[CheckIn] Scheduler error:", e);
     } finally {
@@ -522,30 +543,48 @@ class CheckInPlugin extends Plugin {
     }
   }
 
-  private getTodayRunTime(): string | null {
-    const conf = this.cfg.get();
-    if (!conf.runTimeEnd) return null;
-    if (this.todayRunTime) return this.todayRunTime;
+  private getSHTime(now: Date): { hours: number; minutes: number; date: string } {
+    const fmt = new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "numeric",
+      second: "numeric",
+      hour12: false
+    });
+    const parts = fmt.formatToParts(now);
+    const get = (type: string) => parts.find(p => p.type === type)?.value || "0";
+    return {
+      hours: Number(get("hour")),
+      minutes: Number(get("minute")),
+      date: `${get("year")}/${get("month")}/${get("day")}`
+    };
+  }
 
+  private calculateRunTime(): string {
+    const conf = this.cfg.get();
     const [startH, startM] = conf.runTime.split(":").map(Number);
-    const [endH, endM] = conf.runTimeEnd.split(":").map(Number);
-    
+    const [endH, endM] = conf.runTimeEnd?.split(":").map(Number) || [0, 0];
+
     const startMinutes = startH * 60 + startM;
     let endMinutes = endH * 60 + endM;
-    
-    if (endMinutes < startMinutes) {
+
+    // 处理跨天
+    if (conf.runTimeEnd && endMinutes < startMinutes) {
       endMinutes += 24 * 60;
     }
-    
-    if (endMinutes <= startMinutes) {
+
+    if (!conf.runTimeEnd || endMinutes <= startMinutes) {
       return conf.runTime;
     }
-    
+
     const randomMinute = startMinutes + Math.floor(Math.random() * (endMinutes - startMinutes));
     const finalMinutes = randomMinute >= 24 * 60 ? randomMinute - 24 * 60 : randomMinute;
     const hours = Math.floor(finalMinutes / 60);
     const minutes = finalMinutes % 60;
-    
+
     return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
   }
 
@@ -566,6 +605,16 @@ class CheckInPlugin extends Plugin {
       results.push({ target: t, result: r });
       if (i < enabled.length - 1) await this.sleep(2000);
     }
+
+    // 记录成功目标的签到时间
+    const nowStr = new Date().toLocaleString("zh-CN", { timeZone: SH_TZ });
+    for (const x of results) {
+      if (x.result.success) {
+        const target = conf.targets.find((t) => t.id === x.target.id);
+        if (target) target.lastSignTime = nowStr;
+      }
+    }
+    this.cfg.save({ targets: conf.targets });
 
     const ok = results.filter((x) => x.result.success).length;
     const fail = results.length - ok;
@@ -757,9 +806,7 @@ class CheckInPlugin extends Plugin {
     return !id || Number((msg as any).id || 0) > id;
   }
 
-  private dateCN(d: Date): string {
-    return d.toLocaleDateString("zh-CN", { timeZone: SH_TZ });
-  }
+
 
   private mask(v: string): string {
     if (!v) return "";
