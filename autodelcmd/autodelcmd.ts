@@ -437,18 +437,23 @@ class AutoDeleteService {
       console.log(`[autodelcmd] 匹配规则: ${originalCommand}${paramStr} -> ${matchedRule.delay}秒延迟, 删除响应: ${!!matchedRule.deleteResponse}`);
       
       if (matchedRule.deleteResponse) {
-        // 删除命令及相关响应（仅删除紧跟命令的 bot 响应，不删正常发言）
+        // 删除命令及 TeleBox 的响应消息
+        // 安全策略：只删除命令消息本身 + 紧跟其后的 bot 响应（最多3条）
+        // 不会删除用户的正常发言
         try {
           const chatId = msg.chatId || msg.peerId;
-          const messages = await safeGetMessages(this.client, chatId, { limit: 20 });
+          // 获取命令消息之后的少量消息（limit 设为 MAX_RESPONSE_MESSAGES + buffer）
+          const messages = await safeGetMessages(this.client, chatId, { limit: 10 });
 
-          // 查找最近的响应消息并删除
-          // 在 Saved Messages 中，需要特殊处理消息的归属
           const msgChatId = this.getChatId(msg);
           const isInSavedMessages = cachedUserId && msgChatId?.toString() === cachedUserId;
           
           let deletedCount = 0;
-          const MAX_RESPONSE_MESSAGES = 3; // 最多删除3条响应消息
+          const MAX_RESPONSE_MESSAGES = 3;
+          
+          // 安全策略：只删除 ID 刚好紧跟命令消息的响应
+          // 如果遇到 ID 大于 msg.id 但间隔超过 5 的消息，停止查找（说明中间有用户正常发言隔开了）
+          const ID_GAP_THRESHOLD = 5;
           
           for (const message of messages) {
             // 跳过命令消息本身
@@ -457,29 +462,46 @@ class AutoDeleteService {
             // 达到删除上限，停止查找
             if (deletedCount >= MAX_RESPONSE_MESSAGES) break;
             
+            // 只处理 ID 大于命令消息 ID 的消息（命令之后发送的）
+            if (message.id <= msg.id) continue;
+            
+            // 安全检查：如果消息 ID 与命令 ID 间隔过大，说明不是紧跟的响应，停止查找
+            if (message.id - msg.id > ID_GAP_THRESHOLD + deletedCount) {
+              console.log(`[autodelcmd] 消息 ID ${message.id} 与命令 ID ${msg.id} 间隔过大，停止查找`);
+              break;
+            }
+            
             let shouldDelete = false;
             
             if (isInSavedMessages) {
-              // 在 Saved Messages 中，查找消息ID大于命令消息ID的最近消息作为响应
-              // 因为响应通常在命令之后发送，ID会更大，但获取的消息列表是按时间倒序的
-              if (message.id > msg.id) {
-                shouldDelete = true;
-              }
+              // 在 Saved Messages 中，ID 更大且紧跟命令的就是 bot 响应
+              shouldDelete = true;
             } else {
-              // 在普通聊天中，只删除 bot 发出的响应消息（fromId 指向 bot 或 viaBotId）
-              // 不删除用户自己的正常发言（message.out === true 且无 fromId）
-              const isFromBot = message.fromId || (message as any).viaBotId;
+              // 在普通聊天中，需要区分 bot 响应和用户正常发言
+              // bot 响应特征：viaBotId（通过 bot 发送）或 fromId（bot 账号发送）
+              // 用户正常发言：message.out === true 且无 fromId/viaBotId
+              const viaBotId = (message as any).viaBotId;
+              const fromId = (message as any).fromId;
               const isOwnOutgoing = message.out === true;
-              // 只删除 bot 响应：非自己发出的消息，或自己通过 bot 发出的消息
-              if (!isOwnOutgoing || isFromBot) {
+              
+              if (viaBotId || fromId) {
+                // bot 发出的响应
+                shouldDelete = true;
+              } else if (!isOwnOutgoing) {
+                // 非本人发出的消息（其他人的消息或其他 bot 的消息）
                 shouldDelete = true;
               }
+              // 否则：message.out === true 且无 fromId/viaBotId = 用户正常发言，不删除
             }
             
             if (shouldDelete) {
               console.log(`[autodelcmd] 找到响应消息 ID ${message.id}，将一同删除 (${deletedCount + 1}/${MAX_RESPONSE_MESSAGES})`);
               await this.delayDelete(message, matchedRule.delay);
               deletedCount++;
+            } else {
+              // 遇到不该删除的消息（用户正常发言），停止查找
+              console.log(`[autodelcmd] 消息 ID ${message.id} 不是 bot 响应，停止查找`);
+              break;
             }
           }
           
