@@ -2,7 +2,7 @@
 import { Api } from "teleproto";
 import { Plugin , type PanelSettingsAdapter, type PanelSettingField } from "@utils/pluginBase";
 import { getGlobalClient } from "@utils/runtimeManager";
-import { getPrefixes } from "@utils/pluginManager";
+import { getPrefixes, listCommands } from "@utils/pluginManager";
 import { AliasDB } from "@utils/aliasDB";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
 import fs from "fs/promises";
@@ -437,10 +437,10 @@ class AutoDeleteService {
       console.log(`[autodelcmd] 匹配规则: ${originalCommand}${paramStr} -> ${matchedRule.delay}秒延迟, 删除响应: ${!!matchedRule.deleteResponse}`);
       
       if (matchedRule.deleteResponse) {
-        // 删除命令及相关响应
+        // 删除命令及相关响应（仅删除紧跟命令的 bot 响应，不删正常发言）
         try {
           const chatId = msg.chatId || msg.peerId;
-          const messages = await safeGetMessages(this.client, chatId, { limit: 100 });
+          const messages = await safeGetMessages(this.client, chatId, { limit: 20 });
 
           // 查找最近的响应消息并删除
           // 在 Saved Messages 中，需要特殊处理消息的归属
@@ -466,8 +466,12 @@ class AutoDeleteService {
                 shouldDelete = true;
               }
             } else {
-              // 在普通聊天中，查找自己发出的消息
-              if (message.out) {
+              // 在普通聊天中，只删除 bot 发出的响应消息（fromId 指向 bot 或 viaBotId）
+              // 不删除用户自己的正常发言（message.out === true 且无 fromId）
+              const isFromBot = message.fromId || (message as any).viaBotId;
+              const isOwnOutgoing = message.out === true;
+              // 只删除 bot 响应：非自己发出的消息，或自己通过 bot 发出的消息
+              if (!isOwnOutgoing || isFromBot) {
                 shouldDelete = true;
               }
             }
@@ -720,44 +724,43 @@ class AutoDeletePlugin extends Plugin {
     }
   }
 
-  description: string = `🗑️ 自动删除命令消息插件
+  description: string = `🗑️ <b>自动删除命令消息插件</b>
 
 <b>功能说明:</b>
-- 自动监听并延迟删除特定命令的消息
-- 支持所有配置的自定义前缀和别名命令
-- 支持自定义删除规则和延迟时间
-- 首次运行自动创建配置文件，包含预设的默认规则
+• 自动监听并延迟删除特定命令的消息
+• 支持所有配置的自定义前缀和别名命令
+• 支持自定义删除规则和延迟时间
+• 首次运行自动创建配置文件，包含预设的默认规则
 
 <b>消息处理范围:</b>
-- 自己发出的所有命令消息
-- Saved Messages（收藏夹）中的命令消息
+• 自己发出的已注册命令消息
+• Saved Messages（收藏夹）中的命令消息
 
 <b>配置管理命令:</b>
-• <code>${mainPrefix}autodelcmd on/off</code> - 启用/禁用自动删除功能
-• <code>${mainPrefix}autodelcmd status</code> - 查看功能状态和规则统计
-• <code>${mainPrefix}autodelcmd list</code> - 查看所有规则
-• <code>${mainPrefix}autodelcmd add [命令] [延迟秒数] [参数1] [参数2] [...] [-r] [-e]</code> - 添加规则
-• <code>${mainPrefix}autodelcmd del [规则ID或命令名]</code> - 删除规则或查看规则
-• <code>${mainPrefix}autodelcmd reset</code> - 重置为默认配置
+<code>${mainPrefix}autodelcmd on</code> - 启用自动删除功能
+<code>${mainPrefix}autodelcmd off</code> - 禁用自动删除功能
+<code>${mainPrefix}autodelcmd status</code> - 查看功能状态和规则统计
+<code>${mainPrefix}autodelcmd list</code> - 查看所有规则
+<code>${mainPrefix}autodelcmd add &lt;命令&gt; &lt;延迟秒数&gt; [参数...] [-r] [-e]</code> - 添加规则
+<code>${mainPrefix}autodelcmd del &lt;规则ID或命令名&gt;</code> - 删除规则或查看规则
+<code>${mainPrefix}autodelcmd reset</code> - 重置为默认配置
 
 <b>特殊选项:</b>
-• 🔄 使用 <code>-r</code> 或 <code>--response</code> 参数启用删除响应消息
-• 删除响应指同时删除命令触发的最近一条回复消息
-• 🎯 使用 <code>-e</code> 或 <code>--exact</code> 参数启用精确匹配模式
-• 精确匹配只匹配无参数的命令调用，不匹配带参数的调用
+🔄 <code>-r</code> / <code>--response</code> - 同时删除响应消息
+🎯 <code>-e</code> / <code>--exact</code> - 精确匹配（只匹配无参数调用）
 
 <b>使用示例:</b>
-• <code>${mainPrefix}autodelcmd list</code> - 查看所有配置规则
-• <code>${mainPrefix}autodelcmd add ping 30</code> - ping命令30秒后删除
-• <code>${mainPrefix}autodelcmd add speedtest 60 -r</code> - speedtest命令60秒后删除（🔄包含响应）
-• <code>${mainPrefix}autodelcmd add tpm 60 list ls search</code> - tpm list/ls/search任一命令60秒后删除
-• <code>${mainPrefix}autodelcmd add ping 30 -e</code> - 只有无参数的ping命令30秒后删除
-• <code>${mainPrefix}autodelcmd del ping</code> - 查看ping命令的所有规则
-• <code>${mainPrefix}autodelcmd del 1</code> - 使用ID删除指定规则
-• <code>${mainPrefix}autodelcmd reset</code> - 重置为默认配置
+<code>${mainPrefix}autodelcmd list</code>
+<code>${mainPrefix}autodelcmd add ping 30</code>
+<code>${mainPrefix}autodelcmd add speedtest 60 -r</code>
+<code>${mainPrefix}autodelcmd add tpm 60 list ls search</code>
+<code>${mainPrefix}autodelcmd add ping 30 -e</code>
+<code>${mainPrefix}autodelcmd del ping</code>
+<code>${mainPrefix}autodelcmd del 1</code>
+<code>${mainPrefix}autodelcmd reset</code>
 
 <b>配置文件位置:</b>
-配置文件保存在 <code>assets/autodelcmd/config.json</code>，可直接编辑修改规则。
+<code>assets/autodelcmd/config.json</code> 可直接编辑修改规则。
 
 <b>注意:</b> 插件默认处于禁用状态，需要手动启用才能工作。首次运行会自动创建配置文件并写入默认规则。`;
 
@@ -1160,6 +1163,15 @@ class AutoDeletePlugin extends Plugin {
       const parameters = parts.slice(1); // 其余都是参数
       
       if (!command) return; // 如果只有前缀没有命令，跳过
+
+      // 验证命令是否已注册：只有真正的命令调用才需要自动删除
+      // 避免误删正常发言（如用户输入 ".ping" 作为普通文字）
+      const registeredCommands = listCommands();
+      const resolvedCommand = resolveAlias(command);
+      if (!registeredCommands.includes(resolvedCommand)) {
+        console.log(`[autodelcmd] 跳过非命令消息: ${command} (未注册的命令)`);
+        return;
+      }
       
       console.log(`[autodelcmd] 检测到命令: ${command}, 参数: ${JSON.stringify(parameters)}, 前缀: ${matchedPrefix}, 原始消息: ${messageText}`);
 
