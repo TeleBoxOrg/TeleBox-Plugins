@@ -176,7 +176,7 @@ class CleanPlugin extends Plugin {
       const dialogsMain = await client.getDialogs({});
       let dialogsArchived: any[] = [];
       try {
-        dialogsArchived = await client.getDialogs({ folderId: 1 });
+        dialogsArchived = await client.getDialogs({ folder: 1 });
       } catch (error: any) {
         console.error(`[Clean] 获取归档对话失败:`, error?.message || error);
       }
