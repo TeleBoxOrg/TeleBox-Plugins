@@ -203,12 +203,17 @@ class CleanPlugin extends Plugin {
         for (const [userId, dialog] of dialogByUserId.entries()) {
           try {
             /**
-             * 修复核心：
-             * 1. 使用 dialog.inputEntity 确保 ID 类型在 API 层级完全匹配。
-             * 2. 不传任何参数（默认不开启 revoke），直接从本地对话列表中移除该会话。
-             * 3. 针对已注销账号，开启 revoke 反而会导致删除失败。
+             * 本 fork 的 teleproto 没有 client.deleteDialog，TL 层也没有
+             * messages.deleteDialog / just_remove；改用 messages.deleteHistory
+             * 清空本地历史，会话随之从列表移除。
+             * 不传 revoke：已注销账号无对端可撤销，开启反而可能失败。
              */
-            await client.deleteDialog(dialog.inputEntity);
+            await client.invoke(
+              new Api.messages.DeleteHistory({
+                peer: dialog.inputEntity,
+                maxId: 2147483647,
+              })
+            );
 
             await sleep(150);
           } catch (error: any) {
