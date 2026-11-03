@@ -112,7 +112,7 @@ type CollectTask = AcronTaskBase & {
   type: "collect";
   sourceChat: string; // 来源对话ID或@name
   sourceChatId?: string; // 解析后的来源对话ID（字符串），使用时转 number
-  sender: string; // 发送人：用户名（如 @kaige325）或数字 ID（如 12345678）
+  sender: string; // 发送人：用户名（如 <发送人用户名>）或数字 ID（如 12345678）
   maxCount: number; // 每轮最多转发条数，0 表示不限条数
   lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
 };
@@ -608,13 +608,13 @@ const help_text = `▎定时复制
 
 到点时从来源群拉取最近 100 条消息，只挑指定发送人的新消息，按时间顺序转发到目标群。无新消息则跳过，不重复转发旧消息。首轮没有已处理记录时，转发最近历史里的新消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
 
-• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数）
-• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条）
+• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * <目标对话ID> <来源对话ID> <发送人用户名> 收集08点</code>（不限条数）
+• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * <目标对话ID> <来源对话ID> <发送人用户名> 4 收集12点半</code>（每轮最多 4 条）
 • 发送人后面紧跟一个纯数字就是每轮条数，不写就是不限；注意设了条数时，只转最新那几条，更旧的新消息会被记为已处理、之后不再补发。
 
 上面两条分别对应显示时间 08:00 和 12:30（按本插件已有任务的规律：显示 09:00 对应 cron 0 0 2，显示 06:00 对应 cron 0 0 23，显示 13:00 对应 cron 0 0 6，所以显示 08:00 写 cron 0 0 1，显示 12:30 写 cron 0 30 5）。添加后请以 <code>${mainPrefix}acron ls all</code> 显示的下次时间为准，不要只看 cron 数字。
 
-规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；没有新消息就跳过；发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务。
+规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；没有新消息就跳过；发送人可用用户名（如 <发送人用户名>）或数字 ID，用户名改名后请改用数字 ID 并重建任务。
 
 ▎定时发送
 
@@ -1278,7 +1278,7 @@ class AcronPlugin extends Plugin {
               return;
             }
             if (!senderArg) {
-              await msg.edit({ text: "请提供发送人用户名或数字ID，例如 @kaige325" });
+              await msg.edit({ text: "请提供发送人用户名或数字ID，例如 <发送人用户名>" });
               return;
             }
             // 可选条数：发送人后面紧跟一个纯数字时当作每轮条数（0 表示不限），
