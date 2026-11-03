@@ -36,7 +36,8 @@ type AcronType =
   | "del_re"
   | "pin"
   | "unpin"
-  | "cmd";
+  | "cmd"
+  | "collect";
 
 type AcronTaskBase = {
   id: string; // 自增主键（字符串格式）
@@ -103,6 +104,20 @@ type UnpinTask = AcronTaskBase & {
   msgId: string; // 要取消置顶的消息ID（字符串）
 };
 
+// 新增：定时收集转发任务
+// 来源：固定来源群；发送人：仅匹配该发送人；目标：chat/chatId（沿用现有任务的字段含义）
+// lastSeenId：已处理过的最大消息 ID（字符串）。注意：一次运行里即使只转发了最新 2 条，
+// 也会把该轮所有新消息的最大 ID 记为已处理，避免旧消息被无限排队、下一轮重复处理。
+// 失败时只推进到最后一条成功转发的消息，失败消息下一轮重试。
+type CollectTask = AcronTaskBase & {
+  type: "collect";
+  sourceChat: string; // 来源对话ID或@name
+  sourceChatId?: string; // 解析后的来源对话ID（字符串），使用时转 number
+  sender: string; // 发送人：用户名（如 @kaige325）或数字 ID（如 12345678）
+  maxCount: number; // 每轮最多转发条数，默认 2
+  lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
+};
+
 type AcronTask =
   | SendTask
   | CmdTask
@@ -111,7 +126,8 @@ type AcronTask =
   | DelTask
   | DelReTask
   | PinTask
-  | UnpinTask;
+  | UnpinTask
+  | CollectTask;
 
 type AcronDB = {
   seq: string; // 自增计数器（字符串）
@@ -213,6 +229,40 @@ function parseCronFromArgs(
   return null;
 }
 
+// 收集转发：发送人识别辅助
+// 依次尝试 senderId?.userId、sender?.id、fromId?.userId；用户名取 sender?.username。
+// 若任务里 sender 是纯数字，则按数字 ID 匹配；否则按用户名匹配（忽略大小写和开头的 @）。
+function getMessageSenderId(m: any): number | undefined {
+  const candidates = [
+    m?.senderId?.userId,
+    m?.sender?.id,
+    m?.fromId?.userId,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n)) return Math.trunc(n);
+  }
+  return undefined;
+}
+
+function getMessageSenderUsername(m: any): string | undefined {
+  const u = m?.sender?.username;
+  return typeof u === "string" && u ? u : undefined;
+}
+
+function matchesSender(m: any, sender: string): boolean {
+  const s = String(sender || "").trim();
+  if (!s) return false;
+  if (/^-?\d+$/.test(s)) {
+    const want = Number(s);
+    const got = getMessageSenderId(m);
+    return got !== undefined && got === want;
+  }
+  const wantName = s.replace(/^@/, "").toLowerCase();
+  const gotName = getMessageSenderUsername(m);
+  return !!gotName && gotName.toLowerCase() === wantName;
+}
+
 function buildCopy(task: AcronTask): string {
   if (task.type === "send") {
     const remark = task.remark ? ` ${task.remark}` : "";
@@ -237,6 +287,10 @@ function buildCopy(task: AcronTask): string {
     return `${mainPrefix}acron forward ${t.cron} ${t.chat}${
       t.replyTo ? `|${t.replyTo}` : ""
     }${remark}`;
+  } else if (task.type === "collect") {
+    const remark = task.remark ? ` ${task.remark}` : "";
+    const t = task as CollectTask;
+    return `${mainPrefix}acron collect ${t.cron} ${t.chat} ${t.sourceChat} ${t.sender}${remark}`;
   } else if (task.type === "del") {
     const remark = task.remark ? ` ${task.remark}` : "";
     return `${mainPrefix}acron del ${task.cron} ${task.chat} ${task.msgId}${remark}`;
@@ -377,6 +431,76 @@ async function scheduleTask(task: AcronTask) {
           db.data.tasks[idx].lastError = undefined;
           await db.write();
         }
+      } else if (task.type === "collect") {
+        // 定时收集转发：到点时拉取来源群最近消息，按发送人过滤，只转发未处理过的新消息。
+        // 本分支不使用实时监听、不新增登录，复用 TeleBox 已登录客户端。
+        const t = task as CollectTask;
+        const sourceChatIdNum = toInt(t.sourceChatId);
+        const sourceEntityLike = (sourceChatIdNum as any) ?? t.sourceChat;
+        const maxCount = t.maxCount && t.maxCount > 0 ? t.maxCount : 2;
+        const lastSeen = t.lastSeenId ? toInt(t.lastSeenId) : undefined;
+
+        const messages = await safeGetMessages(client, sourceEntityLike as any, {
+          limit: 100,
+        });
+        // 过滤发送人，按消息 ID 升序（时间顺序）排列
+        const filtered = ((messages || []) as any[])
+          .filter((m) => matchesSender(m, t.sender))
+          .filter((m) => typeof m?.id === "number")
+          .sort((a, b) => a.id - b.id);
+        // 未处理过的新消息：lastSeenId 未设置时首轮取最近历史，见 help 说明
+        const fresh = lastSeen === undefined
+          ? filtered
+          : filtered.filter((m) => m.id > lastSeen);
+        if (fresh.length === 0) {
+          if (idx >= 0) {
+            db.data.tasks[idx].lastRunAt = String(now);
+            db.data.tasks[idx].lastResult = `暂无新消息，已跳过`;
+            db.data.tasks[idx].lastError = undefined;
+            await db.write();
+          }
+        } else {
+          // 最多转发最新 maxCount 条（按时间顺序转发）
+          const toForward = fresh.slice(-maxCount);
+          let lastOkId: number | undefined = undefined;
+          let forwarded = 0;
+          let failed: any = undefined;
+          for (const m of toForward) {
+            try {
+              await client.invoke(
+                new Api.messages.ForwardMessages({
+                  fromPeer: sourceEntityLike,
+                  id: [m.id],
+                  toPeer: entityLike,
+                }),
+              );
+              lastOkId = m.id;
+              forwarded += 1;
+            } catch (e: any) {
+              failed = e;
+              break;
+            }
+          }
+          if (idx >= 0) {
+            const stored = db.data.tasks[idx] as CollectTask;
+            db.data.tasks[idx].lastRunAt = String(now);
+            if (failed) {
+              // 失败时只推进到最后一条成功转发的消息，失败消息下一轮重试，不紧循环重试
+              if (lastOkId !== undefined) stored.lastSeenId = String(lastOkId);
+              db.data.tasks[idx].lastResult =
+                forwarded > 0 ? `已转发 ${forwarded} 条，后续失败` : `转发失败`;
+              db.data.tasks[idx].lastError = String(failed?.message || failed);
+            } else {
+              // 成功时把本轮所有新消息的最大 ID 记为已处理：
+              // 即使只转发了最新 2 条，更旧的新消息也不会被无限排队，下一轮只看更新的消息。
+              stored.lastSeenId = String(fresh[fresh.length - 1].id);
+              db.data.tasks[idx].lastResult = `已转发 ${forwarded} 条消息`;
+              db.data.tasks[idx].lastError = undefined;
+            }
+            await db.write();
+          }
+          if (failed) throw failed;
+        }
       } else if (task.type === "del") {
         const t = task as DelTask;
         const msgIdNum = toInt(t.msgId);
@@ -480,6 +604,17 @@ const help_text = `▎定时复制
 
 • 使用 <code>${mainPrefix}acron forward 0 0 2 * * * 对话ID/@name [备注]</code> 回复一条消息
 • 使用 <code>${mainPrefix}acron forward 0 0 2 * * * 对话ID/@name|发送时的话题ID [备注]</code> 回复一条消息
+
+▎定时收集转发
+
+到点时从来源群拉取最近 100 条消息，只挑指定发送人的新消息，按时间顺序最多转发 2 条到目标群。无新消息则跳过，不重复转发旧消息。首轮没有已处理记录时，转发最近历史里的最新 2 条。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
+
+• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>
+• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 kaige收集12点半</code>
+
+上面两条分别对应显示时间 08:00 和 12:30（按本插件已有任务的规律：显示 09:00 对应 cron 0 0 2，显示 06:00 对应 cron 0 0 23，显示 13:00 对应 cron 0 0 6，所以显示 08:00 写 cron 0 0 1，显示 12:30 写 cron 0 30 5）。添加后请以 <code>${mainPrefix}acron ls all</code> 显示的下次时间为准，不要只看 cron 数字。
+
+规则：每轮最多 2 条；只有 1 条新消息就发 1 条；没有新消息就跳过；发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务。
 
 ▎定时发送
 
@@ -585,6 +720,7 @@ class AcronPlugin extends Plugin {
             "del_re",
             "pin",
             "unpin",
+            "collect",
           ].includes(maybeType as any)
             ? (maybeType as AcronType)
             : undefined;
@@ -606,7 +742,9 @@ class AcronPlugin extends Plugin {
                           ? "置顶"
                           : tp === "unpin"
                             ? "取消置顶"
-                            : String(tp || "");
+                            : tp === "collect"
+                              ? "收集转发"
+                              : String(tp || "");
 
           const db = await getDB();
           const chatId = Number(msg.chatId);
@@ -668,6 +806,19 @@ class AcronPlugin extends Plugin {
                   `<code>${t.chat}</code>`
                 }`,
               );
+              if (t.type === "collect") {
+                const ct = t as CollectTask;
+                const sourceInfo = await formatEntity(
+                  ct.sourceChatId ?? ct.sourceChat,
+                );
+                lines.push(
+                  `来源: ${sourceInfo?.display || `<code>${ct.sourceChat}</code>`}`,
+                );
+                lines.push(`发送人: <code>${ct.sender}</code>`);
+                if (ct.lastSeenId) {
+                  lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
+                }
+              }
               const msgId = (t as any)?.msgId;
               const fromChatId = (t as any)?.fromChatId;
               const fromMsgId = (t as any)?.fromMsgId;
@@ -734,6 +885,19 @@ class AcronPlugin extends Plugin {
               lines.push(
                 `对话: ${entityInfo?.display || `<code>${t.chat}</code>`}`,
               );
+              if (t.type === "collect") {
+                const ct = t as CollectTask;
+                const sourceInfo = await formatEntity(
+                  ct.sourceChatId ?? ct.sourceChat,
+                );
+                lines.push(
+                  `来源: ${sourceInfo?.display || `<code>${ct.sourceChat}</code>`}`,
+                );
+                lines.push(`发送人: <code>${ct.sender}</code>`);
+                if (ct.lastSeenId) {
+                  lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
+                }
+              }
               // 禁用状态不显示下次执行
               if (t.lastRunAt) {
                 lines.push(
@@ -868,7 +1032,8 @@ class AcronPlugin extends Plugin {
           sub === "del" ||
           sub === "del_re" ||
           sub === "pin" ||
-          sub === "unpin"
+          sub === "unpin" ||
+          sub === "collect"
         ) {
           const argRest = args.slice(1); // 跳过子命令
           const parsed = parseCronFromArgs(argRest);
@@ -1097,6 +1262,62 @@ class AcronPlugin extends Plugin {
               await msg.edit({ text: tip, parseMode: "html" });
               return;
             }
+          } else if (sub === "collect") {
+            // 定时收集转发：不需要回复源消息，参数就是目标、来源、发送人
+            // rest 顺序：[目标对话, 来源对话, 发送人, ...备注在整行里]
+            const sourceChatArg = rest[1];
+            const senderArg = rest[2];
+            if (!sourceChatArg) {
+              await msg.edit({ text: "请提供来源对话ID或@name" });
+              return;
+            }
+            if (!senderArg) {
+              await msg.edit({ text: "请提供发送人用户名或数字ID，例如 @kaige325" });
+              return;
+            }
+            // 备注：命令词 + collect + 6 段 cron + 目标 + 来源 + 发送人 = 11 个词，n=10
+            const remark = getRemarkFromMsg(lines[0], 10);
+            const { id: resolvedSourceChatId, display: sourceDisplay } =
+              await formatEntity(sourceChatArg);
+            const sourceChatIdNum = Number(resolvedSourceChatId);
+            const hasSourceChatId = Number.isFinite(sourceChatIdNum)
+              ? String(sourceChatIdNum)
+              : undefined;
+
+            const task: CollectTask = {
+              id,
+              type: "collect",
+              cron: cronExpr,
+              chat: chatArg,
+              chatId: hasChatId as any,
+              sourceChat: sourceChatArg,
+              sourceChatId: hasSourceChatId as any,
+              sender: senderArg,
+              maxCount: 2,
+              createdAt: String(Date.now()),
+              remark: remark || undefined,
+              display: display || undefined,
+            };
+
+            db.data.tasks.push(task);
+            await db.write();
+            await scheduleTask(task);
+
+            const nextAt = (cron as any).sendAt(cronExpr);
+            const tip = [
+              "✅ 已添加定时收集转发任务",
+              `ID: <code>${id}</code>`,
+              `对话: ${display}`,
+              `来源: ${sourceDisplay}`,
+              `发送人: <code>${senderArg}</code>`,
+              ...(task.remark ? [`备注: ${task.remark}`] : []),
+              nextAt ? `下次执行: ${formatDate(nextAt.toJSDate())}` : "",
+              `复制: ${buildCopyCommand(task)}`,
+            ]
+              .filter(Boolean)
+              .join("\n");
+            await msg.edit({ text: tip, parseMode: "html" });
+            return;
           } else if (sub === "del") {
             const msgIdStr = rest[1];
 
