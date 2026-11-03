@@ -112,9 +112,19 @@ type CollectTask = AcronTaskBase & {
   type: "collect";
   sourceChat: string; // 来源对话ID或@name
   sourceChatId?: string; // 解析后的来源对话ID（字符串），使用时转 number
-  sender: string; // 发送人：用户名（如 <发送人用户名>）或数字 ID（如 12345678）
+  sender: string; // 发送人：用户名（如 @kaige325）或数字 ID（如 12345678）
   maxCount: number; // 每轮最多转发条数，0 表示不限条数
   lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
+  // 回执与记录（通用版）：回执接收人需用 setreceipt 后补设置，未设置时不发 Telegram 回执，只记历史。
+  // 设了才发给指定 ID，不发到目标群和来源群。
+  receiptTo?: string; // 回执接收人数字 ID（字符串），未设置 = 不发回执
+  history?: Array<{
+    time: string; // 时间戳（字符串）
+    count: number; // 本轮转发成功条数
+    ids: string; // 本轮转发成功的原消息 ID，逗号分隔，跳过时为空
+    result: string; // 本轮结果，与 lastResult 一致
+    error?: string;
+  }>;
 };
 
 type AcronTask =
@@ -453,9 +463,20 @@ async function scheduleTask(task: AcronTask) {
           : filtered.filter((m) => m.id > lastSeen);
         if (fresh.length === 0) {
           if (idx >= 0) {
+            const storedSkip = db.data.tasks[idx] as CollectTask;
             db.data.tasks[idx].lastRunAt = String(now);
             db.data.tasks[idx].lastResult = `暂无新消息，已跳过`;
             db.data.tasks[idx].lastError = undefined;
+            // 只记历史，不发 Telegram 回执，避免无新消息时也打扰所有者
+            storedSkip.history = storedSkip.history || [];
+            storedSkip.history.push({
+              time: String(now),
+              count: 0,
+              ids: "",
+              result: `暂无新消息，已跳过`,
+            });
+            if (storedSkip.history.length > 20)
+              storedSkip.history = storedSkip.history.slice(-20);
             await db.write();
           }
         } else {
@@ -464,6 +485,7 @@ async function scheduleTask(task: AcronTask) {
           let lastOkId: number | undefined = undefined;
           let forwarded = 0;
           let failed: any = undefined;
+          const forwardedIds: number[] = [];
           for (const m of toForward) {
             try {
               await client.invoke(
@@ -475,6 +497,7 @@ async function scheduleTask(task: AcronTask) {
               );
               lastOkId = m.id;
               forwarded += 1;
+              forwardedIds.push(m.id);
             } catch (e: any) {
               failed = e;
               break;
@@ -496,7 +519,53 @@ async function scheduleTask(task: AcronTask) {
               db.data.tasks[idx].lastResult = `已转发 ${forwarded} 条消息`;
               db.data.tasks[idx].lastError = undefined;
             }
+            // 回执记录：每次有转发或失败都记历史（最近 20 次），与 lastResult 分开保存，
+            // 下一次运行不会覆盖历史。回执只发给 setreceipt 指定的接收人私聊，不发到目标群和来源群；未设置时不发。
+            stored.history = stored.history || [];
+            stored.history.push({
+              time: String(now),
+              count: forwarded,
+              ids: forwardedIds.join(","),
+              result: db.data.tasks[idx].lastResult || "",
+              error: failed ? String(failed?.message || failed) : undefined,
+            });
+            if (stored.history.length > 20)
+              stored.history = stored.history.slice(-20);
             await db.write();
+            // 转发成功或部分成功/失败后发回执；回执发送失败不影响本次转发结果，
+            // 只记日志，不抛错、不重试，避免回执失败导致转发被误记为失败。
+            // 后补规则：未设置 receiptTo 或 receiptTo 为 off 时只记历史，不发 Telegram 消息；
+            // 只有用 setreceipt 设了指定 ID 之后，才发给那个 ID。
+            const receiptRaw = String(stored.receiptTo || "").trim();
+            const receiptTo = toInt(receiptRaw);
+            if (receiptRaw !== "off" && receiptTo !== undefined) try {
+              const runTime = formatDate(new Date(now));
+              const remarkText = t.remark ? `任务：${t.remark}\n` : "";
+              const statusText = failed
+                ? forwarded > 0
+                  ? `⚠️ 收集转发部分成功，已转发 ${forwarded} 条，后续失败`
+                  : `❌ 收集转发失败`
+                : `✅ 收集转发成功，已转发 ${forwarded} 条`;
+              const receiptText =
+                `${statusText}\n` +
+                `${remarkText}` +
+                `时间：${runTime}\n` +
+                `来源：${t.sourceChat} 发送人：${t.sender}\n` +
+                `目标：${t.chat}\n` +
+                `原消息 ID：${forwardedIds.join(",") || "无"}\n` +
+                (failed
+                  ? `错误：${String(failed?.message || failed)}\n`
+                  : "") +
+                `已处理ID：${stored.lastSeenId || "无"}`;
+              await client.sendMessage(receiptTo as any, {
+                message: receiptText,
+              });
+            } catch (receiptErr: any) {
+              console.error(
+                `[acron] 收集回执发送失败（不影响转发结果）:`,
+                receiptErr,
+              );
+            }
           }
           if (failed) throw failed;
         }
@@ -608,13 +677,15 @@ const help_text = `▎定时复制
 
 到点时从来源群拉取最近 100 条消息，只挑指定发送人的新消息，按时间顺序转发到目标群。无新消息则跳过，不重复转发旧消息。首轮没有已处理记录时，转发最近历史里的新消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
 
-• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * <目标对话ID> <来源对话ID> <发送人用户名> 收集08点</code>（不限条数）
-• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * <目标对话ID> <来源对话ID> <发送人用户名> 4 收集12点半</code>（每轮最多 4 条）
+• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数）
+• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条）
 • 发送人后面紧跟一个纯数字就是每轮条数，不写就是不限；注意设了条数时，只转最新那几条，更旧的新消息会被记为已处理、之后不再补发。
 
 上面两条分别对应显示时间 08:00 和 12:30（按本插件已有任务的规律：显示 09:00 对应 cron 0 0 2，显示 06:00 对应 cron 0 0 23，显示 13:00 对应 cron 0 0 6，所以显示 08:00 写 cron 0 0 1，显示 12:30 写 cron 0 30 5）。添加后请以 <code>${mainPrefix}acron ls all</code> 显示的下次时间为准，不要只看 cron 数字。
 
-规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；没有新消息就跳过；发送人可用用户名（如 <发送人用户名>）或数字 ID，用户名改名后请改用数字 ID 并重建任务。
+规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；没有新消息就跳过；发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务。
+
+• 回执设置：<code>${mainPrefix}acron setreceipt 任务ID 接收人数字ID</code>，例如 <code>${mainPrefix}acron setreceipt 9 123456789</code>；<code>${mainPrefix}acron setreceipt all 123456789</code> 改全部收集任务；<code>${mainPrefix}acron setreceipt 9 off</code> 关闭 Telegram 回执（只记历史）；不写接收人就是查看当前设置。未设置回执 ID 时不发 Telegram 回执，只记历史；用 setreceipt 设了之后，才发给指定 ID。
 
 ▎定时发送
 
@@ -821,6 +892,28 @@ class AcronPlugin extends Plugin {
                 if (ct.lastSeenId) {
                   lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
                 }
+                lines.push(
+                  `回执: ${
+                    ct.receiptTo
+                      ? ct.receiptTo === "off"
+                        ? "已关闭"
+                        : `<code>${ct.receiptTo}</code>`
+                      : "未设置（不发回执）"
+                  }`,
+                );
+                if (ct.history && ct.history.length > 0) {
+                  const recent = ct.history.slice(-3);
+                  lines.push(
+                    `最近记录: ${recent
+                      .map(
+                        (h) =>
+                          `${formatDate(new Date(Number(h.time)))} ${h.result}${
+                            h.ids ? ` ID:${h.ids}` : ""
+                          }`,
+                      )
+                      .join(" | ")}`,
+                  );
+                }
               }
               const msgId = (t as any)?.msgId;
               const fromChatId = (t as any)?.fromChatId;
@@ -960,6 +1053,122 @@ class AcronPlugin extends Plugin {
           await db.write();
           await msg.edit({
             text: `✅ 已删除任务 <code>${id}</code>`,
+            parseMode: "html",
+          });
+          return;
+        }
+
+        if (sub === "setreceipt" || sub === "receipt") {
+          const id = args[1];
+          const target = args[2];
+          if (!id) {
+            await msg.edit({
+              text: `用法: <code>${mainPrefix}acron setreceipt 任务ID 接收人数字ID</code>\n例如: <code>${mainPrefix}acron setreceipt 9 123456789</code>\n全部收集任务: <code>${mainPrefix}acron setreceipt all 123456789</code>\n关闭 Telegram 回执（只记历史）: <code>${mainPrefix}acron setreceipt 9 off</code>\n只看当前设置: <code>${mainPrefix}acron setreceipt 9</code>`,
+              parseMode: "html",
+            });
+            return;
+          }
+          const db = await getDB();
+          const applyReceipt = (t: AcronTask): string | null => {
+            if (t.type !== "collect") return null;
+            if (!target) {
+              const cur = (t as CollectTask).receiptTo;
+              return cur
+                ? cur === "off"
+                  ? "已关闭"
+                  : cur
+                : "未设置（不发回执）";
+            }
+            if (target === "off") {
+              (t as CollectTask).receiptTo = "off";
+              return "已关闭";
+            }
+            if (!/^-?\d+$/.test(target)) return "无效";
+            (t as CollectTask).receiptTo = String(Number(target));
+            return String(Number(target));
+          };
+          if (id === "all") {
+            const collectTasks = db.data.tasks.filter(
+              (t) => t.type === "collect",
+            );
+            if (collectTasks.length === 0) {
+              await msg.edit({
+                text: `没有收集转发任务`,
+                parseMode: "html",
+              });
+              return;
+            }
+            if (!target) {
+              const lines = collectTasks.map((t) => {
+                const cur = (t as CollectTask).receiptTo;
+                const show = cur
+                  ? cur === "off"
+                    ? "已关闭"
+                    : cur
+                  : "未设置（不发回执）";
+                return `<code>${t.id}</code> ${t.remark || ""} 回执: ${show}`;
+              });
+              await msg.edit({
+                text: `收集任务回执设置:\n${lines.join("\n")}`,
+                parseMode: "html",
+              });
+              return;
+            }
+            if (target !== "off" && !/^-?\d+$/.test(target)) {
+              await msg.edit({
+                text: `接收人 ID 必须是数字，例如 123456789，或 off`,
+                parseMode: "html",
+              });
+              return;
+            }
+            for (const t of collectTasks) applyReceipt(t);
+            await db.write();
+            await msg.edit({
+              text: `✅ 已设置全部 ${collectTasks.length} 个收集任务的回执接收人: <code>${target}</code>`,
+              parseMode: "html",
+            });
+            return;
+          }
+          const idx = db.data.tasks.findIndex((t) => t.id === id);
+          if (idx < 0) {
+            await msg.edit({
+              text: `未找到任务: <code>${id}</code>`,
+              parseMode: "html",
+            });
+            return;
+          }
+          const t = db.data.tasks[idx];
+          if (t.type !== "collect") {
+            await msg.edit({
+              text: `任务 <code>${id}</code> 不是收集转发任务，只有收集任务支持回执设置`,
+              parseMode: "html",
+            });
+            return;
+          }
+          if (!target) {
+            const cur = (t as CollectTask).receiptTo;
+            const show = cur
+              ? cur === "off"
+                ? "已关闭"
+                : cur
+              : "未设置（不发回执）";
+            await msg.edit({
+              text: `任务 <code>${id}</code> ${t.remark || ""} 当前回执接收人: <code>${show}</code>`,
+              parseMode: "html",
+            });
+            return;
+          }
+          const result = applyReceipt(t);
+          if (result === "无效") {
+            await msg.edit({
+              text: `接收人 ID 必须是数字，例如 123456789，或 off`,
+              parseMode: "html",
+            });
+            return;
+          }
+          await db.write();
+          await msg.edit({
+            text: `✅ 已设置任务 <code>${id}</code> ${t.remark || ""} 的回执接收人: <code>${result}</code>`,
             parseMode: "html",
           });
           return;
@@ -1278,7 +1487,7 @@ class AcronPlugin extends Plugin {
               return;
             }
             if (!senderArg) {
-              await msg.edit({ text: "请提供发送人用户名或数字ID，例如 <发送人用户名>" });
+              await msg.edit({ text: "请提供发送人用户名或数字ID，例如 @kaige325" });
               return;
             }
             // 可选条数：发送人后面紧跟一个纯数字时当作每轮条数（0 表示不限），
