@@ -106,15 +106,14 @@ type UnpinTask = AcronTaskBase & {
 
 // 新增：定时收集转发任务
 // 来源：固定来源群；发送人：仅匹配该发送人；目标：chat/chatId（沿用现有任务的字段含义）
-// lastSeenId：已处理过的最大消息 ID（字符串）。注意：一次运行里即使只转发了最新 2 条，
-// 也会把该轮所有新消息的最大 ID 记为已处理，避免旧消息被无限排队、下一轮重复处理。
-// 失败时只推进到最后一条成功转发的消息，失败消息下一轮重试。
+// lastSeenId：已处理过的最大消息 ID（字符串）。maxCount 为 0 时表示不限条数，
+// 本轮全部新消息都会转发。失败时只推进到最后一条成功转发的消息，失败消息下一轮重试。
 type CollectTask = AcronTaskBase & {
   type: "collect";
   sourceChat: string; // 来源对话ID或@name
   sourceChatId?: string; // 解析后的来源对话ID（字符串），使用时转 number
   sender: string; // 发送人：用户名（如 @kaige325）或数字 ID（如 12345678）
-  maxCount: number; // 每轮最多转发条数，默认 2
+  maxCount: number; // 每轮最多转发条数，0 表示不限条数
   lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
 };
 
@@ -290,7 +289,7 @@ function buildCopy(task: AcronTask): string {
   } else if (task.type === "collect") {
     const remark = task.remark ? ` ${task.remark}` : "";
     const t = task as CollectTask;
-    return `${mainPrefix}acron collect ${t.cron} ${t.chat} ${t.sourceChat} ${t.sender}${remark}`;
+    return `${mainPrefix}acron collect ${t.cron} ${t.chat} ${t.sourceChat} ${t.sender}${t.maxCount > 0 ? ` ${t.maxCount}` : ""}${remark}`;
   } else if (task.type === "del") {
     const remark = task.remark ? ` ${task.remark}` : "";
     return `${mainPrefix}acron del ${task.cron} ${task.chat} ${task.msgId}${remark}`;
@@ -437,7 +436,7 @@ async function scheduleTask(task: AcronTask) {
         const t = task as CollectTask;
         const sourceChatIdNum = toInt(t.sourceChatId);
         const sourceEntityLike = (sourceChatIdNum as any) ?? t.sourceChat;
-        const maxCount = t.maxCount && t.maxCount > 0 ? t.maxCount : 2;
+        const maxCount = t.maxCount ?? 0;
         const lastSeen = t.lastSeenId ? toInt(t.lastSeenId) : undefined;
 
         const messages = await safeGetMessages(client, sourceEntityLike as any, {
@@ -460,8 +459,8 @@ async function scheduleTask(task: AcronTask) {
             await db.write();
           }
         } else {
-          // 最多转发最新 maxCount 条（按时间顺序转发）
-          const toForward = fresh.slice(-maxCount);
+          // maxCount > 0 时只转发最新 maxCount 条；maxCount 为 0 时转发全部新消息（按时间顺序）
+          const toForward = maxCount > 0 ? fresh.slice(-maxCount) : fresh;
           let lastOkId: number | undefined = undefined;
           let forwarded = 0;
           let failed: any = undefined;
@@ -491,8 +490,8 @@ async function scheduleTask(task: AcronTask) {
                 forwarded > 0 ? `已转发 ${forwarded} 条，后续失败` : `转发失败`;
               db.data.tasks[idx].lastError = String(failed?.message || failed);
             } else {
-              // 成功时把本轮所有新消息的最大 ID 记为已处理：
-              // 即使只转发了最新 2 条，更旧的新消息也不会被无限排队，下一轮只看更新的消息。
+              // 成功时把本轮所有新消息的最大 ID 记为已处理。
+              // 不限条数时本轮新消息已全部转发，所以这样记不会丢消息。
               stored.lastSeenId = String(fresh[fresh.length - 1].id);
               db.data.tasks[idx].lastResult = `已转发 ${forwarded} 条消息`;
               db.data.tasks[idx].lastError = undefined;
@@ -607,14 +606,15 @@ const help_text = `▎定时复制
 
 ▎定时收集转发
 
-到点时从来源群拉取最近 100 条消息，只挑指定发送人的新消息，按时间顺序最多转发 2 条到目标群。无新消息则跳过，不重复转发旧消息。首轮没有已处理记录时，转发最近历史里的最新 2 条。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
+到点时从来源群拉取最近 100 条消息，只挑指定发送人的新消息，按时间顺序转发到目标群。无新消息则跳过，不重复转发旧消息。首轮没有已处理记录时，转发最近历史里的新消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
 
-• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>
-• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 kaige收集12点半</code>
+• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数）
+• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条）
+• 发送人后面紧跟一个纯数字就是每轮条数，不写就是不限；注意设了条数时，只转最新那几条，更旧的新消息会被记为已处理、之后不再补发。
 
 上面两条分别对应显示时间 08:00 和 12:30（按本插件已有任务的规律：显示 09:00 对应 cron 0 0 2，显示 06:00 对应 cron 0 0 23，显示 13:00 对应 cron 0 0 6，所以显示 08:00 写 cron 0 0 1，显示 12:30 写 cron 0 30 5）。添加后请以 <code>${mainPrefix}acron ls all</code> 显示的下次时间为准，不要只看 cron 数字。
 
-规则：每轮最多 2 条；只有 1 条新消息就发 1 条；没有新消息就跳过；发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务。
+规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；没有新消息就跳过；发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务。
 
 ▎定时发送
 
@@ -815,6 +815,9 @@ class AcronPlugin extends Plugin {
                   `来源: ${sourceInfo?.display || `<code>${ct.sourceChat}</code>`}`,
                 );
                 lines.push(`发送人: <code>${ct.sender}</code>`);
+                lines.push(
+                  `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
+                );
                 if (ct.lastSeenId) {
                   lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
                 }
@@ -894,6 +897,9 @@ class AcronPlugin extends Plugin {
                   `来源: ${sourceInfo?.display || `<code>${ct.sourceChat}</code>`}`,
                 );
                 lines.push(`发送人: <code>${ct.sender}</code>`);
+                lines.push(
+                  `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
+                );
                 if (ct.lastSeenId) {
                   lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
                 }
@@ -1275,8 +1281,15 @@ class AcronPlugin extends Plugin {
               await msg.edit({ text: "请提供发送人用户名或数字ID，例如 @kaige325" });
               return;
             }
-            // 备注：命令词 + collect + 6 段 cron + 目标 + 来源 + 发送人 = 11 个词，n=10
-            const remark = getRemarkFromMsg(lines[0], 10);
+            // 可选条数：发送人后面紧跟一个纯数字时当作每轮条数（0 表示不限），
+            // 否则默认不限；有条数时备注从条数之后开始算（命令词 + collect + 6 段 cron + 目标 + 来源 + 发送人 + 条数 = 12 个词，n=11），无条数时 n=10
+            const countArg = rest[3];
+            const countNum =
+              countArg && /^\d+$/.test(countArg) ? Number(countArg) : undefined;
+            const remark = getRemarkFromMsg(
+              lines[0],
+              countNum !== undefined ? 11 : 10,
+            );
             const { id: resolvedSourceChatId, display: sourceDisplay } =
               await formatEntity(sourceChatArg);
             const sourceChatIdNum = Number(resolvedSourceChatId);
@@ -1293,7 +1306,7 @@ class AcronPlugin extends Plugin {
               sourceChat: sourceChatArg,
               sourceChatId: hasSourceChatId as any,
               sender: senderArg,
-              maxCount: 2,
+              maxCount: countNum !== undefined ? countNum : 0,
               createdAt: String(Date.now()),
               remark: remark || undefined,
               display: display || undefined,
@@ -1310,6 +1323,7 @@ class AcronPlugin extends Plugin {
               `对话: ${display}`,
               `来源: ${sourceDisplay}`,
               `发送人: <code>${senderArg}</code>`,
+              `每轮条数: ${task.maxCount > 0 ? `${task.maxCount} 条` : "不限"}`,
               ...(task.remark ? [`备注: ${task.remark}`] : []),
               nextAt ? `下次执行: ${formatDate(nextAt.toJSDate())}` : "",
               `复制: ${buildCopyCommand(task)}`,
