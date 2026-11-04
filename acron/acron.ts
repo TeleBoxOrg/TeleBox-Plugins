@@ -112,7 +112,7 @@ type CollectTask = AcronTaskBase & {
   type: "collect";
   sourceChat: string; // 来源对话ID或@name
   sourceChatId?: string; // 解析后的来源对话ID（字符串），使用时转 number
-  sender: string; // 发送人：单个用户名（如 @example_user）或数字 ID，或逗号分隔的多个发送人（最多 5 个，如 @example_bot,@example_user），无空格；写一个 * 或不写发送人，都表示任意真人用户（机器人除外，只看定时点之前、由近到远不限时间找，不回补已转过的旧消息）
+  sender: string; // 发送人：单个用户名（如 @kaige325）或数字 ID，或逗号分隔的多个发送人（最多 5 个，如 @DNSHEbot,@kaige325），无空格；写一个 * 或不写发送人，都表示任意真人用户（机器人除外，只看定时点之前、由近到远不限时间找，不回补已转过的旧消息）
   maxCount: number; // 每轮最多转发条数，0 表示不限条数
   lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
   // 回执与记录（通用版）：回执接收人需用 setreceipt 后补设置，未设置时不发 Telegram 回执，只记历史。
@@ -241,7 +241,7 @@ function parseCronFromArgs(
 // 收集转发：发送人识别辅助
 // 依次尝试 senderId?.userId、sender?.id、fromId?.userId；用户名取 sender?.username。
 // 若任务里 sender 是纯数字，则按数字 ID 匹配；否则按用户名匹配（忽略大小写和开头的 @）。
-// 多发送人：sender 可以是逗号分隔的列表（最多 5 个，如 @example_bot,@example_user），任一匹配即算命中，
+// 多发送人：sender 可以是逗号分隔的列表（最多 5 个，如 @DNSHEbot,@kaige325），任一匹配即算命中，
 // 这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上，避免整轮无话可转。
 function getMessageSenderId(m: any): number | undefined {
   const candidates = [
@@ -315,7 +315,7 @@ function isPlausibleSenderToken(token: string): boolean {
 
 // 真人用户判断：有发送人 ID、不是机器人、不是频道/匿名管理员身份。
 // 机器人判断依赖消息自带的 sender.bot 字段，TeleBox 拉取的群消息通常已带 sender，
-// 所以 @example_bot 这类机器人消息能被挡住；sender 未加载时按非机器人处理，避免正常用户消息因缓存缺失被误杀。
+// 所以 @DNSHEbot 这类机器人消息能被挡住；sender 未加载时按非机器人处理，避免正常用户消息因缓存缺失被误杀。
 function isAnyUserMessage(m: any): boolean {
   if (getMessageSenderId(m) === undefined) return false;
   if ((m as any)?.action !== undefined) return false; // 服务消息（入群、置顶等），不是用户说话
@@ -831,19 +831,19 @@ const help_text = `▎定时复制
 
 ▎定时收集转发
 
-到点时从来源群拉取最近 100 条消息，只挑指定发送人的消息，按时间顺序转发到目标群。发送人可以写多个，最多 5 个，用英文逗号连接、不要加空格，例如 @example_bot,@example_user，任一发送人的消息都算数，这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上；发送人不写就是任意真人用户，见下面任意用户模式，那个模式不限时间、不回补旧消息。设了每轮条数时，每轮必须转满规定条数（条数是所有发送人加起来的总数，不是每人几条）：新消息够数就转最新那几条新消息，新消息不够数就从定时点往回找，用最近 24 小时内的旧消息补足，完全没有新消息时就直接转定时点之前最近 24 小时内的几条旧消息（旧消息会在多轮里重复出现）。只有最近 24 小时内所有发送人都没有消息时，才无法转发，这时也照样发回执，写 (无话可转)。首轮没有已处理记录时，转发最近历史里的消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
+到点时从来源群拉取最近 100 条消息，只挑指定发送人的消息，按时间顺序转发到目标群。发送人可以写多个，最多 5 个，用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325，任一发送人的消息都算数，这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上；发送人不写就是任意真人用户，见下面任意用户模式，那个模式不限时间、不回补旧消息。设了每轮条数时，每轮必须转满规定条数（条数是所有发送人加起来的总数，不是每人几条）：新消息够数就转最新那几条新消息，新消息不够数就从定时点往回找，用最近 24 小时内的旧消息补足，完全没有新消息时就直接转定时点之前最近 24 小时内的几条旧消息（旧消息会在多轮里重复出现）。只有最近 24 小时内所有发送人都没有消息时，才无法转发，这时也照样发回执，写 (无话可转)。首轮没有已处理记录时，转发最近历史里的消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
 
-• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1001234567890 -1000987654321 @example_user 收集08点</code>（不限条数）
-• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1001234567890 -1000987654321 @example_user 4 收集12点半</code>（每轮最多 4 条）
+• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数）
+• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条）
 • 发送人后面紧跟一个纯数字就是每轮条数，不写就是不限；注意设了条数时，只转最新那几条，更旧的新消息会被记为已处理、之后不再补发。
 
 上面两条分别对应显示时间 08:00 和 12:30（按本插件已有任务的规律：显示 09:00 对应 cron 0 0 2，显示 06:00 对应 cron 0 0 23，显示 13:00 对应 cron 0 0 6，所以显示 08:00 写 cron 0 0 1，显示 12:30 写 cron 0 30 5）。添加后请以 <code>${mainPrefix}acron ls all</code> 显示的下次时间为准，不要只看 cron 数字。
 
-规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；设了条数时每轮必须转满该条数，没有新消息或新消息不够数时就往回找最近 24 小时内的旧消息补足（会重复转发旧消息）；不设条数（不限）时只转新消息，不回补；最近 24 小时内所有发送人都没有消息时，无法转发但照样发回执 (无话可转)。发送人可用用户名（如 @example_user）或数字 ID，用户名改名后请改用数字 ID 并重建任务；发送人最多 5 个，用英文逗号连接、不要加空格，例如 @example_bot,@example_user，超过 5 个建任务时会直接报错。
+规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；设了条数时每轮必须转满该条数，没有新消息或新消息不够数时就往回找最近 24 小时内的旧消息补足（会重复转发旧消息）；不设条数（不限）时只转新消息，不回补；最近 24 小时内所有发送人都没有消息时，无法转发但照样发回执 (无话可转)。发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务；发送人最多 5 个，用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325，超过 5 个建任务时会直接报错。
 
-任意用户模式：发送人不写就是任意真人用户，写一个 <code>*</code> 也是任意真人用户，群里任意真人用户说话都转，机器人发的消息除外（包括 @example_bot，机器人判断看消息的 sender.bot）。这个模式和指定发送人任务是分开的：指定发送人任务仍按上面的 24 小时回补规则走，任意用户模式不走回补——只看定时点之前的消息，在来源群最近 100 条里由近到远不限时间找，离定时点最近的先算，按每轮条数转最新的几条新消息（转发时仍按时间顺序发）；新消息不够数也不拿旧消息凑，没有新消息就跳过并照样发回执 (无话可转/暂无新消息)，不把已经转过的旧消息翻出来再转。想同时要机器人消息就保留原来的 @example_bot,@example_user 任务。
-• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1001234567890 -1000987654321 * 2 任意用户收集12点</code>（12:00 那轮，只转定时点之前离 12:00 最近的真人用户发的最新 2 条，不限时间往回找，机器人除外，不回补旧消息）
-• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1001234567890 -1000987654321 2 任意用户收集12点</code>（和上一条一样：发送人位置直接写条数 2，就表示不指定发送人、任意用户；发送人位置的小数字当条数，大数字才当数字 ID 发送人）
+任意用户模式：发送人不写就是任意真人用户，写一个 <code>*</code> 也是任意真人用户，群里任意真人用户说话都转，机器人发的消息除外（包括 @DNSHEbot，机器人判断看消息的 sender.bot）。这个模式和指定发送人任务是分开的：指定发送人任务仍按上面的 24 小时回补规则走，任意用户模式不走回补——只看定时点之前的消息，在来源群最近 100 条里由近到远不限时间找，离定时点最近的先算，按每轮条数转最新的几条新消息（转发时仍按时间顺序发）；新消息不够数也不拿旧消息凑，没有新消息就跳过并照样发回执 (无话可转/暂无新消息)，不把已经转过的旧消息翻出来再转。想同时要机器人消息就保留原来的 @DNSHEbot,@kaige325 任务。
+• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1002443712513 -1003219886860 * 2 任意用户收集12点</code>（12:00 那轮，只转定时点之前离 12:00 最近的真人用户发的最新 2 条，不限时间往回找，机器人除外，不回补旧消息）
+• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1002443712513 -1003219886860 2 任意用户收集12点</code>（和上一条一样：发送人位置直接写条数 2，就表示不指定发送人、任意用户；发送人位置的小数字当条数，大数字才当数字 ID 发送人）
 • 注意：备注如果是纯英文/数字下划线单词，容易被误当成发送人，不指定发送人时建议写 <code>*</code> 或先写条数，不要只写一个英文备注词。
 
 • 回执设置：<code>${mainPrefix}acron setreceipt 任务ID 接收人数字ID</code>，例如 <code>${mainPrefix}acron setreceipt 9 123456789</code>；<code>${mainPrefix}acron setreceipt all 123456789</code> 改全部收集任务；<code>${mainPrefix}acron setreceipt 9 off</code> 关闭 Telegram 回执（只记历史）；不写接收人就是查看当前设置。未设置回执 ID 时不发 Telegram 回执，只记历史；用 setreceipt 设了之后，才发给指定 ID。
@@ -905,6 +905,7 @@ ${mainPrefix}eat set</pre>
 • <code>${mainPrefix}acron ls del</code> - 列出当前会话中的类型为 del 的定时任务
 • <code>${mainPrefix}acron ls all del</code>, <code>${mainPrefix}acron la del</code> - 列出所有的类型为 del 的定时任务
 • <code>${mainPrefix}acron rm 定时任务ID</code> - 删除指定的定时任务，一次删多个请用空格分隔，例如 <code>${mainPrefix}acron rm 7 8 9 10 11</code>，只删其中一个就只写一个 ID，例如 <code>${mainPrefix}acron rm 7</code>
+• <code>${mainPrefix}acron edit 定时任务ID time 0 0 13 * * *</code> - 直接改任务，不用删了重建：改时间用 time（或 cron），改目标用 target/chat，改备注用 remark；收集任务还能改 source/sender/count；改来源会清空已处理ID（旧来源的消息 ID 对新来源没有意义），其他改动保留 ID、历史、回执和已处理ID；消息内容和源消息不能用 edit 改，仍需删了重建
 • <code>${mainPrefix}acron disable/off 定时任务ID</code> - 禁用指定的定时任务
 • <code>${mainPrefix}acron enable/on 定时任务ID</code> - 启用指定的定时任务
 `;
@@ -1188,6 +1189,270 @@ class AcronPlugin extends Plugin {
             }
           }
           return;
+        }
+
+        if (sub === "edit") {
+          // 直接编辑：.acron edit <ID> <字段> <新值>，不用删了重建。
+          // 改时间、目标、备注适用于所有类型；source/sender/count 只适用于收集任务。
+          // 编辑保留任务 ID、创建时间、历史、回执和已处理ID（改来源除外：来源变了，旧已处理ID清空，
+          // 否则新来源里 ID 更小的消息会被误当成已处理而跳过）。
+          // 不能用 edit 改的：send/cmd 的消息内容、copy/forward 的源消息，仍需删了重建。
+          const id = args[1];
+          const fieldRaw = (args[2] || "").toLowerCase();
+          const usage = `用法:\n<code>${mainPrefix}acron edit 任务ID time 0 0 13 * * *</code> 改时间\n<code>${mainPrefix}acron edit 任务ID target 对话ID/@name</code> 改目标（chat 也一样）\n<code>${mainPrefix}acron edit 任务ID remark 新备注</code> 改备注，写 <code>-</code> 清空备注\n收集任务专用:\n<code>${mainPrefix}acron edit 任务ID source 来源对话ID/@name</code> 改来源（会清空已处理ID）\n<code>${mainPrefix}acron edit 任务ID sender @example_bot,@example_user</code> 改发送人（* = 任意真人用户，最多 5 个）\n<code>${mainPrefix}acron edit 任务ID count 2</code> 改每轮条数（0 = 不限）\n只写 <code>${mainPrefix}acron edit 任务ID</code> 查看当前可改的字段`;
+          if (!id) {
+            await msg.edit({ text: usage, parseMode: "html" });
+            return;
+          }
+          const db = await getDB();
+          const idx = db.data.tasks.findIndex((t) => t.id === id);
+          if (idx < 0) {
+            await msg.edit({
+              text: `未找到任务: <code>${id}</code>`,
+              parseMode: "html",
+            });
+            return;
+          }
+          const t = db.data.tasks[idx];
+          if (!fieldRaw) {
+            const cur: string[] = [
+              `任务 <code>${id}</code> ${t.remark || ""}（${t.type}）`,
+              `当前时间: <code>${t.cron}</code>`,
+              `目标: <code>${t.chat}</code>`,
+            ];
+            if (t.type === "collect") {
+              const ct = t as CollectTask;
+              cur.push(`来源: <code>${ct.sourceChat}</code>`);
+              cur.push(`发送人: <code>${ct.sender}</code>`);
+              cur.push(
+                `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
+              );
+              if (ct.lastSeenId)
+                cur.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
+              if (ct.receiptTo)
+                cur.push(`回执: <code>${ct.receiptTo}</code>`);
+            }
+            cur.push(`备注: ${t.remark || "（无）"}`);
+            cur.push("");
+            cur.push(usage);
+            await msg.edit({ text: cur.join("\n"), parseMode: "html" });
+            return;
+          }
+          const field =
+            fieldRaw === "time" || fieldRaw === "cron" || fieldRaw === "时间"
+              ? "time"
+              : fieldRaw === "target" ||
+                  fieldRaw === "chat" ||
+                  fieldRaw === "目标"
+                ? "chat"
+                : fieldRaw === "source" || fieldRaw === "来源"
+                  ? "source"
+                  : fieldRaw === "sender" || fieldRaw === "发送人"
+                    ? "sender"
+                    : fieldRaw === "count" ||
+                        fieldRaw === "maxcount" ||
+                        fieldRaw === "条数"
+                      ? "count"
+                      : fieldRaw === "remark" || fieldRaw === "备注"
+                        ? "remark"
+                        : "";
+          if (!field) {
+            await msg.edit({
+              text: `未知字段: <code>${fieldRaw}</code>\n${usage}`,
+              parseMode: "html",
+            });
+            return;
+          }
+          if (
+            (field === "source" || field === "sender" || field === "count") &&
+            t.type !== "collect"
+          ) {
+            await msg.edit({
+              text: `任务 <code>${id}</code> 不是收集转发任务，只有收集任务能改 ${field}`,
+              parseMode: "html",
+            });
+            return;
+          }
+          const valueTokens = args.slice(3);
+          if (field === "time") {
+            const parsed = parseCronFromArgs(valueTokens);
+            if (!parsed || parsed.rest.length > 0) {
+              await msg.edit({
+                text: `时间后面只能写 6 段 Cron，例如: <code>${mainPrefix}acron edit ${id} time 0 0 13 * * *</code>`,
+                parseMode: "html",
+              });
+              return;
+            }
+            const validation = (cron as any).validateCronExpression
+              ? (cron as any).validateCronExpression(parsed.cron)
+              : { valid: true };
+            if (!validation.valid) {
+              await msg.edit({
+                text: `Cron 校验失败: ${validation.error || "无效表达式"}`,
+              });
+              return;
+            }
+            const oldCron = t.cron;
+            t.cron = parsed.cron;
+            const key = makeCronKey(id);
+            cronManager.del(key);
+            await db.write();
+            if (!t.disabled) await scheduleTask(t as AcronTask);
+            const nextAt = t.disabled
+              ? null
+              : (cron as any).sendAt(t.cron);
+            await msg.edit({
+              text: [
+                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的时间`,
+                `时间: <code>${oldCron}</code> → <code>${t.cron}</code>`,
+                t.disabled
+                  ? "任务处于禁用状态，本次只改了设置，下次不执行，直到 enable"
+                  : nextAt
+                    ? `下次执行: ${formatDate(nextAt.toJSDate())}`
+                    : "",
+                `复制: ${buildCopyCommand(t as AcronTask)}`,
+              ]
+                .filter(Boolean)
+                .join("\n"),
+              parseMode: "html",
+            });
+            return;
+          }
+          if (field === "remark") {
+            if (valueTokens.length === 0) {
+              await msg.edit({
+                text: `请写新备注，例如: <code>${mainPrefix}acron edit ${id} remark 新备注</code>，写 <code>-</code> 清空备注`,
+                parseMode: "html",
+              });
+              return;
+            }
+            const joined = valueTokens.join(" ");
+            const oldRemark = t.remark || "（无）";
+            t.remark = joined === "-" ? undefined : joined;
+            await db.write();
+            await msg.edit({
+              text: [
+                `✅ 已修改任务 <code>${id}</code> 的备注`,
+                `备注: ${oldRemark} → ${t.remark || "（无）"}`,
+                `复制: ${buildCopyCommand(t as AcronTask)}`,
+              ].join("\n"),
+              parseMode: "html",
+            });
+            return;
+          }
+          // 其余字段都只接受一个值
+          if (valueTokens.length !== 1) {
+            await msg.edit({
+              text: `${field} 只能写一个值，例如: <code>${mainPrefix}acron edit ${id} ${field} 值</code>`,
+              parseMode: "html",
+            });
+            return;
+          }
+          const value = valueTokens[0];
+          if (field === "chat") {
+            const oldChat = t.chat;
+            const { id: resolvedChatId, display } =
+              await formatEntity(value);
+            const chatIdNum = Number(resolvedChatId);
+            t.chat = value;
+            (t as any).chatId = Number.isFinite(chatIdNum)
+              ? String(chatIdNum)
+              : undefined;
+            if (display) t.display = display;
+            await db.write();
+            await msg.edit({
+              text: [
+                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的目标`,
+                `目标: <code>${oldChat}</code> → <code>${value}</code>`,
+                `复制: ${buildCopyCommand(t as AcronTask)}`,
+              ].join("\n"),
+              parseMode: "html",
+            });
+            return;
+          }
+          if (field === "source") {
+            const ct = t as CollectTask;
+            const oldSource = ct.sourceChat;
+            const { id: resolvedSourceChatId } = await formatEntity(value);
+            const sourceChatIdNum = Number(resolvedSourceChatId);
+            ct.sourceChat = value;
+            (ct as any).sourceChatId = Number.isFinite(sourceChatIdNum)
+              ? String(sourceChatIdNum)
+              : undefined;
+            const hadLastSeen = !!ct.lastSeenId;
+            ct.lastSeenId = undefined;
+            await db.write();
+            await msg.edit({
+              text: [
+                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的来源`,
+                `来源: <code>${oldSource}</code> → <code>${value}</code>`,
+                hadLastSeen
+                  ? "已处理ID已清空（来源变了，旧 ID 对新来源没有意义），下轮按新来源的最近消息算"
+                  : "",
+                `复制: ${buildCopyCommand(t as AcronTask)}`,
+              ]
+                .filter(Boolean)
+                .join("\n"),
+              parseMode: "html",
+            });
+            return;
+          }
+          if (field === "sender") {
+            const ct = t as CollectTask;
+            const oldSender = ct.sender;
+            if (value !== "*" && !isPlausibleSenderToken(value)) {
+              await msg.edit({
+                text: `发送人写法不对，例如 @example_bot,@example_user，或 *（任意真人用户）`,
+                parseMode: "html",
+              });
+              return;
+            }
+            const senderList = parseSenderList(value);
+            if (
+              !isAnyUserSender(value) &&
+              (senderList.length === 0 || senderList.length > 5)
+            ) {
+              await msg.edit({
+                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再改，多个发送人之间用英文逗号连接、不要加空格，例如 @example_bot,@example_user`,
+              });
+              return;
+            }
+            ct.sender = value;
+            await db.write();
+            await msg.edit({
+              text: [
+                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的发送人`,
+                `发送人: <code>${oldSender}</code> → <code>${value}</code>`,
+                "已处理ID保留不变，下轮仍从上次已处理的位置往后算",
+                `复制: ${buildCopyCommand(t as AcronTask)}`,
+              ].join("\n"),
+              parseMode: "html",
+            });
+            return;
+          }
+          // count
+          {
+            const ct = t as CollectTask;
+            if (!/^\d+$/.test(value)) {
+              await msg.edit({
+                text: `每轮条数必须是数字，例如 <code>${mainPrefix}acron edit ${id} count 2</code>，0 = 不限`,
+                parseMode: "html",
+              });
+              return;
+            }
+            const oldCount = ct.maxCount;
+            ct.maxCount = Number(value);
+            await db.write();
+            await msg.edit({
+              text: [
+                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的每轮条数`,
+                `每轮条数: ${oldCount > 0 ? `${oldCount} 条` : "不限"} → ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
+                `复制: ${buildCopyCommand(t as AcronTask)}`,
+              ].join("\n"),
+              parseMode: "html",
+            });
+            return;
+          }
         }
 
         if (sub === "rm") {
@@ -1712,7 +1977,7 @@ class AcronPlugin extends Plugin {
                 senderConsumed = 0;
               }
             }
-            // 多发送人：逗号分隔、无空格，最多 5 个，例如 @example_bot,@example_user
+            // 多发送人：逗号分隔、无空格，最多 5 个，例如 @DNSHEbot,@kaige325
             // 任意用户模式：发送人只写一个 *（或不写），不走 5 个上限，建任务时直接放行
             const senderList = parseSenderList(senderArg);
             if (!isAnyUserSender(senderArg) && senderList.length === 0) {
@@ -1721,7 +1986,7 @@ class AcronPlugin extends Plugin {
             }
             if (!isAnyUserSender(senderArg) && senderList.length > 5) {
               await msg.edit({
-                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再建，多个发送人之间用英文逗号连接、不要加空格，例如 @example_bot,@example_user`,
+                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再建，多个发送人之间用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325`,
               });
               return;
             }
