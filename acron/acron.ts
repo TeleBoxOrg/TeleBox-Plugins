@@ -112,7 +112,7 @@ type CollectTask = AcronTaskBase & {
   type: "collect";
   sourceChat: string; // 来源对话ID或@name
   sourceChatId?: string; // 解析后的来源对话ID（字符串），使用时转 number
-  sender: string; // 发送人：单个用户名（如 @kaige325）或数字 ID，或逗号分隔的多个发送人（最多 5 个，如 @DNSHEbot,@kaige325），无空格
+  sender: string; // 发送人：单个用户名（如 @example_user）或数字 ID，或逗号分隔的多个发送人（最多 5 个，如 @example_bot,@example_user），无空格；写一个 * 或不写发送人，都表示任意真人用户（机器人除外，只看定时点之前、由近到远不限时间找，不回补已转过的旧消息）
   maxCount: number; // 每轮最多转发条数，0 表示不限条数
   lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
   // 回执与记录（通用版）：回执接收人需用 setreceipt 后补设置，未设置时不发 Telegram 回执，只记历史。
@@ -241,7 +241,7 @@ function parseCronFromArgs(
 // 收集转发：发送人识别辅助
 // 依次尝试 senderId?.userId、sender?.id、fromId?.userId；用户名取 sender?.username。
 // 若任务里 sender 是纯数字，则按数字 ID 匹配；否则按用户名匹配（忽略大小写和开头的 @）。
-// 多发送人：sender 可以是逗号分隔的列表（最多 5 个，如 @DNSHEbot,@kaige325），任一匹配即算命中，
+// 多发送人：sender 可以是逗号分隔的列表（最多 5 个，如 @example_bot,@example_user），任一匹配即算命中，
 // 这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上，避免整轮无话可转。
 function getMessageSenderId(m: any): number | undefined {
   const candidates = [
@@ -288,6 +288,42 @@ function parseSenderList(sender: string): string[] {
     .split(/[,，]+/)
     .map((p) => p.trim())
     .filter(Boolean);
+}
+
+// 任意用户模式：发送人写一个 *，或者创建时根本没写发送人，都表示来源群里任意真人用户，机器人除外。
+// 2026-11-04 用户定：这个模式不限时间——只看定时点之前的消息，由近到远找，离定时点最近的先算，
+// 不设 60 分钟窗口，也不用 24 小时旧消息回补；只转上轮之后的新消息，没新消息就无话可转（仍发回执），
+// 不把已经转过的旧消息翻出来再转一遍。注意拉取仍是来源群最近 100 条，在这 100 条里不限时间往回找。
+function isAnyUserSender(sender: string): boolean {
+  const s = String(sender || "").trim();
+  return s === "" || s === "*";
+}
+
+// 发送人位置的 token 是不是一个像样的发送人写法：@用户名、纯数字 ID、*，或用英文/中文逗号连起来的多个这类写法。
+// 创建时用它区分“没写发送人”：例如备注是中文词时，它不是发送人写法，就按任意用户处理，而不是把备注误当成发送人。
+function isPlausibleSenderToken(token: string): boolean {
+  const parts = String(token || "")
+    .split(/[,，]+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return false;
+  return parts.every(
+    (p) =>
+      p === "*" || /^-?\d+$/.test(p) || /^@?[A-Za-z0-9_]{1,64}$/.test(p),
+  );
+}
+
+// 真人用户判断：有发送人 ID、不是机器人、不是频道/匿名管理员身份。
+// 机器人判断依赖消息自带的 sender.bot 字段，TeleBox 拉取的群消息通常已带 sender，
+// 所以 @example_bot 这类机器人消息能被挡住；sender 未加载时按非机器人处理，避免正常用户消息因缓存缺失被误杀。
+function isAnyUserMessage(m: any): boolean {
+  if (getMessageSenderId(m) === undefined) return false;
+  if ((m as any)?.action !== undefined) return false; // 服务消息（入群、置顶等），不是用户说话
+  const sender = (m as any)?.sender;
+  if (sender?.bot === true) return false;
+  if (sender?.className === "Channel") return false;
+  if ((m as any)?.senderId?.channelId !== undefined) return false;
+  return true;
 }
 
 function buildCopy(task: AcronTask): string {
@@ -459,7 +495,8 @@ async function scheduleTask(task: AcronTask) {
           await db.write();
         }
       } else if (task.type === "collect") {
-        // 定时收集转发：到点时拉取来源群最近消息，按发送人过滤，设了条数时每轮必须转满规定条数，不够就往回找旧消息补足。
+        // 定时收集转发：到点时拉取来源群最近消息，按发送人过滤；指定发送人时设了条数每轮必须转满规定条数，不够就往回找旧消息补足。
+        // 任意用户模式（发送人 * 或空）除外：不限时间、只转新消息、不回补，见下面 isAnyUser 分支。
         // 本分支不使用实时监听、不新增登录，复用 TeleBox 已登录客户端。
         const t = task as CollectTask;
         const sourceChatIdNum = toInt(t.sourceChatId);
@@ -470,9 +507,10 @@ async function scheduleTask(task: AcronTask) {
         const messages = await safeGetMessages(client, sourceEntityLike as any, {
           limit: 100,
         });
-        // 过滤发送人，按消息 ID 升序（时间顺序）排列，再只留最近 24 小时内的消息。
-        // 2026-11-04 用户定：往回找只找 24 小时内的，超过 24 小时的旧消息不再转；
+        // 过滤发送人，按消息 ID 升序（时间顺序）排列。
+        // 指定发送人模式：再只留最近 24 小时内的消息，2026-11-04 用户定往回找只找 24 小时内的，超过 24 小时的旧消息不再转；
         // 24 小时内根本没有该发送人消息时，才算无话可转。
+        // 任意用户模式：不留 24 小时限制，只留定时点之前的消息，不限时间往回找。
         // 日期字段缺失时按最近处理，避免因字段缺失误判为过期。
         const msgTime = (m: any): number => {
           const d = (m as any)?.date;
@@ -484,11 +522,22 @@ async function scheduleTask(task: AcronTask) {
           }
           return now;
         };
-        const filtered = ((messages || []) as any[])
-          .filter((m) => matchesSender(m, t.sender))
-          .filter((m) => typeof m?.id === "number")
-          .filter((m) => msgTime(m) >= now - 24 * 60 * 60 * 1000)
-          .sort((a, b) => a.id - b.id);
+        const isAnyUser = isAnyUserSender(t.sender);
+        // 任意用户模式：只看定时点之前的真人消息，机器人除外，不限时间——
+        // 在最近 100 条里由近到远找，离定时点最近的先算，不设时间窗口；
+        // 不走 24 小时回补，也不把已转过的旧消息翻出来。
+        // 指定发送人模式：保持原有 24 小时回补规则不变。
+        const filtered = isAnyUser
+          ? ((messages || []) as any[])
+              .filter((m) => isAnyUserMessage(m))
+              .filter((m) => typeof m?.id === "number")
+              .filter((m) => msgTime(m) <= now)
+              .sort((a, b) => a.id - b.id)
+          : ((messages || []) as any[])
+              .filter((m) => matchesSender(m, t.sender))
+              .filter((m) => typeof m?.id === "number")
+              .filter((m) => msgTime(m) >= now - 24 * 60 * 60 * 1000)
+              .sort((a, b) => a.id - b.id);
         // 未处理过的新消息：lastSeenId 未设置时首轮取最近历史，见 help 说明
         const fresh = lastSeen === undefined
           ? filtered
@@ -499,18 +548,24 @@ async function scheduleTask(task: AcronTask) {
         // 这样目标群每轮都会收到规定条数，但旧消息会在多轮里重复出现，这是按规定条数转的必然结果。
         // maxCount = 0（不限）时仍只转新消息，不回补旧消息，避免每轮重转全部历史。
         // 只有来源最近 24 小时内完全没有该发送人的消息时，才无法转任何消息，这时仍记跳过，但照样发回执（无话可转）。
-        const toForward =
-          maxCount > 0
+        // 任意用户模式除外：只转上轮之后的新消息，新消息不够数也不回补旧消息；没新消息就跳过并照样发回执，不把旧消息翻出来凑条数。
+        // 找的顺序是定时点之前由近到远：下面 fresh.slice(-maxCount) 就是取离定时点最近的 maxCount 条新消息，转发时仍按时间顺序发，群里不倒序。
+        const toForward = isAnyUser
+          ? maxCount > 0
+            ? fresh.slice(-maxCount)
+            : fresh
+          : maxCount > 0
             ? fresh.length >= maxCount
               ? fresh.slice(-maxCount)
               : filtered.slice(-maxCount)
             : fresh;
-        const isFallback = maxCount > 0 && fresh.length < maxCount;
+        const isFallback = !isAnyUser && maxCount > 0 && fresh.length < maxCount;
         if (toForward.length === 0) {
           if (idx >= 0) {
             const storedSkip = db.data.tasks[idx] as CollectTask;
-            // 设了条数时到这里只可能是一种情况：最近 24 小时内完全没有该发送人消息；
+            // 设了条数时到这里只可能是一种情况：最近 24 小时内完全没有该发送人消息（任意用户模式则是最近 100 条里完全没有真人消息）；
             // 不限条数时到这里可能是无新消息。两种情况现在都发回执，不再静默跳过。
+            // 任意用户模式到这里还可能是：最近 100 条里有真人消息，但都已经转过——这时不回补旧消息，只记暂无新消息，照样发回执。
             const noMsgIn24h = filtered.length === 0;
             const skipResult = noMsgIn24h
               ? `无话可转，已跳过`
@@ -776,15 +831,20 @@ const help_text = `▎定时复制
 
 ▎定时收集转发
 
-到点时从来源群拉取最近 100 条消息，只挑指定发送人的消息，按时间顺序转发到目标群。发送人可以写多个，最多 5 个，用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325，任一发送人的消息都算数，这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上。设了每轮条数时，每轮必须转满规定条数（条数是所有发送人加起来的总数，不是每人几条）：新消息够数就转最新那几条新消息，新消息不够数就从定时点往回找，用最近 24 小时内的旧消息补足，完全没有新消息时就直接转定时点之前最近 24 小时内的几条旧消息（旧消息会在多轮里重复出现）。只有最近 24 小时内所有发送人都没有消息时，才无法转发，这时也照样发回执，写 (无话可转)。首轮没有已处理记录时，转发最近历史里的消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
+到点时从来源群拉取最近 100 条消息，只挑指定发送人的消息，按时间顺序转发到目标群。发送人可以写多个，最多 5 个，用英文逗号连接、不要加空格，例如 @example_bot,@example_user，任一发送人的消息都算数，这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上；发送人不写就是任意真人用户，见下面任意用户模式，那个模式不限时间、不回补旧消息。设了每轮条数时，每轮必须转满规定条数（条数是所有发送人加起来的总数，不是每人几条）：新消息够数就转最新那几条新消息，新消息不够数就从定时点往回找，用最近 24 小时内的旧消息补足，完全没有新消息时就直接转定时点之前最近 24 小时内的几条旧消息（旧消息会在多轮里重复出现）。只有最近 24 小时内所有发送人都没有消息时，才无法转发，这时也照样发回执，写 (无话可转)。首轮没有已处理记录时，转发最近历史里的消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
 
-• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数）
-• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条）
+• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1001234567890 -1000987654321 @example_user 收集08点</code>（不限条数）
+• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1001234567890 -1000987654321 @example_user 4 收集12点半</code>（每轮最多 4 条）
 • 发送人后面紧跟一个纯数字就是每轮条数，不写就是不限；注意设了条数时，只转最新那几条，更旧的新消息会被记为已处理、之后不再补发。
 
 上面两条分别对应显示时间 08:00 和 12:30（按本插件已有任务的规律：显示 09:00 对应 cron 0 0 2，显示 06:00 对应 cron 0 0 23，显示 13:00 对应 cron 0 0 6，所以显示 08:00 写 cron 0 0 1，显示 12:30 写 cron 0 30 5）。添加后请以 <code>${mainPrefix}acron ls all</code> 显示的下次时间为准，不要只看 cron 数字。
 
-规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；设了条数时每轮必须转满该条数，没有新消息或新消息不够数时就往回找最近 24 小时内的旧消息补足（会重复转发旧消息）；不设条数（不限）时只转新消息，不回补；最近 24 小时内所有发送人都没有消息时，无法转发但照样发回执 (无话可转)。发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务；发送人最多 5 个，用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325，超过 5 个建任务时会直接报错。
+规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；设了条数时每轮必须转满该条数，没有新消息或新消息不够数时就往回找最近 24 小时内的旧消息补足（会重复转发旧消息）；不设条数（不限）时只转新消息，不回补；最近 24 小时内所有发送人都没有消息时，无法转发但照样发回执 (无话可转)。发送人可用用户名（如 @example_user）或数字 ID，用户名改名后请改用数字 ID 并重建任务；发送人最多 5 个，用英文逗号连接、不要加空格，例如 @example_bot,@example_user，超过 5 个建任务时会直接报错。
+
+任意用户模式：发送人不写就是任意真人用户，写一个 <code>*</code> 也是任意真人用户，群里任意真人用户说话都转，机器人发的消息除外（包括 @example_bot，机器人判断看消息的 sender.bot）。这个模式和指定发送人任务是分开的：指定发送人任务仍按上面的 24 小时回补规则走，任意用户模式不走回补——只看定时点之前的消息，在来源群最近 100 条里由近到远不限时间找，离定时点最近的先算，按每轮条数转最新的几条新消息（转发时仍按时间顺序发）；新消息不够数也不拿旧消息凑，没有新消息就跳过并照样发回执 (无话可转/暂无新消息)，不把已经转过的旧消息翻出来再转。想同时要机器人消息就保留原来的 @example_bot,@example_user 任务。
+• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1001234567890 -1000987654321 * 2 任意用户收集12点</code>（12:00 那轮，只转定时点之前离 12:00 最近的真人用户发的最新 2 条，不限时间往回找，机器人除外，不回补旧消息）
+• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1001234567890 -1000987654321 2 任意用户收集12点</code>（和上一条一样：发送人位置直接写条数 2，就表示不指定发送人、任意用户；发送人位置的小数字当条数，大数字才当数字 ID 发送人）
+• 注意：备注如果是纯英文/数字下划线单词，容易被误当成发送人，不指定发送人时建议写 <code>*</code> 或先写条数，不要只写一个英文备注词。
 
 • 回执设置：<code>${mainPrefix}acron setreceipt 任务ID 接收人数字ID</code>，例如 <code>${mainPrefix}acron setreceipt 9 123456789</code>；<code>${mainPrefix}acron setreceipt all 123456789</code> 改全部收集任务；<code>${mainPrefix}acron setreceipt 9 off</code> 关闭 Telegram 回执（只记历史）；不写接收人就是查看当前设置。未设置回执 ID 时不发 Telegram 回执，只记历史；用 setreceipt 设了之后，才发给指定 ID。
 
@@ -1617,36 +1677,66 @@ class AcronPlugin extends Plugin {
           } else if (sub === "collect") {
             // 定时收集转发：不需要回复源消息，参数就是目标、来源、发送人
             // rest 顺序：[目标对话, 来源对话, 发送人, ...备注在整行里]
+            // 2026-11-04 用户定：发送人可以不写——不写就是任意真人用户。
+            // 具体分三种，都存成 *，原有指定发送人逻辑不动：
+            // 1) 发送人位置直接写 *；2) 发送人位置直接写条数（小数字，如 2），条数后面跟备注；
+            // 3) 发送人位置直接写备注（备注不是发送人写法时，如中文备注），或发送人位置什么都不写。
+            // 注意：发送人位置的纯数字要区分条数和数字 ID 发送人——条数一般很小，数字 ID 都是 9-10 位大数字，
+            // 所以这里只把 <=100 的小数字当条数；大数字仍当数字 ID 发送人，原有任务不受影响。
+            // 另外备注如果是纯英文/数字下划线单词，容易被误当成发送人，不指定发送人时建议写 * 或先写条数。
             const sourceChatArg = rest[1];
-            const senderArg = rest[2];
+            const senderRaw = rest[2];
             if (!sourceChatArg) {
               await msg.edit({ text: "请提供来源对话ID或@name" });
               return;
             }
-            if (!senderArg) {
-              await msg.edit({ text: "请提供发送人用户名或数字ID，例如 @kaige325" });
-              return;
+            let senderArg = "*";
+            let senderConsumed = 0;
+            if (senderRaw !== undefined) {
+              if (senderRaw === "*") {
+                senderArg = "*";
+                senderConsumed = 1;
+              } else if (
+                /^\d+$/.test(senderRaw) &&
+                Number(senderRaw) <= 100
+              ) {
+                // 小数字：当条数处理，发送人不消费这个位置，条数解析时会吃掉它
+                senderArg = "*";
+                senderConsumed = 0;
+              } else if (isPlausibleSenderToken(senderRaw)) {
+                senderArg = senderRaw;
+                senderConsumed = 1;
+              } else {
+                // 不是发送人写法（如中文备注）：当备注开头，发送人默认为任意用户
+                senderArg = "*";
+                senderConsumed = 0;
+              }
             }
-            // 多发送人：逗号分隔、无空格，最多 5 个，例如 @DNSHEbot,@kaige325
+            // 多发送人：逗号分隔、无空格，最多 5 个，例如 @example_bot,@example_user
+            // 任意用户模式：发送人只写一个 *（或不写），不走 5 个上限，建任务时直接放行
             const senderList = parseSenderList(senderArg);
-            if (senderList.length === 0) {
+            if (!isAnyUserSender(senderArg) && senderList.length === 0) {
               await msg.edit({ text: "发送人不能为空" });
               return;
             }
-            if (senderList.length > 5) {
+            if (!isAnyUserSender(senderArg) && senderList.length > 5) {
               await msg.edit({
-                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再建，多个发送人之间用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325`,
+                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再建，多个发送人之间用英文逗号连接、不要加空格，例如 @example_bot,@example_user`,
               });
               return;
             }
             // 可选条数：发送人后面紧跟一个纯数字时当作每轮条数（0 表示不限），
-            // 否则默认不限；有条数时备注从条数之后开始算（命令词 + collect + 6 段 cron + 目标 + 来源 + 发送人 + 条数 = 12 个词，n=11），无条数时 n=10
-            const countArg = rest[3];
+            // 发送人没写时，发送人位置的小数字本身就是条数；
+            // 否则默认不限。备注位置按实际消费的词数算：整行词数 = 命令词 + collect + 6 段 cron + 目标 + 来源 + 已消费的发送人/条数词数，
+            // getRemarkFromMsg 的 n = 总词数 - 1，所以 n = 9 + senderConsumed + countConsumed。
+            // 例如指定发送人+条数是 n=11，指定发送人无条数是 n=10，不写发送人+条数是 n=10，不写发送人也不写条数是 n=9。
+            const countArg = rest[2 + senderConsumed];
             const countNum =
               countArg && /^\d+$/.test(countArg) ? Number(countArg) : undefined;
+            const countConsumed = countNum !== undefined ? 1 : 0;
             const remark = getRemarkFromMsg(
               lines[0],
-              countNum !== undefined ? 11 : 10,
+              9 + senderConsumed + countConsumed,
             );
             const { id: resolvedSourceChatId, display: sourceDisplay } =
               await formatEntity(sourceChatArg);
@@ -1681,6 +1771,9 @@ class AcronPlugin extends Plugin {
               `对话: ${display}`,
               `来源: ${sourceDisplay}`,
               `发送人: <code>${senderArg}</code>`,
+              ...(isAnyUserSender(senderArg)
+                ? [`模式: 任意真人用户（机器人除外，只看定时点之前、由近到远不限时间找，不回补已转过的旧消息，没新消息就无话可转）`]
+                : []),
               `每轮条数: ${task.maxCount > 0 ? `${task.maxCount} 条` : "不限"}`,
               ...(task.remark ? [`备注: ${task.remark}`] : []),
               nextAt ? `下次执行: ${formatDate(nextAt.toJSDate())}` : "",
