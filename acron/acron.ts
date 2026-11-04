@@ -112,7 +112,7 @@ type CollectTask = AcronTaskBase & {
   type: "collect";
   sourceChat: string; // 来源对话ID或@name
   sourceChatId?: string; // 解析后的来源对话ID（字符串），使用时转 number
-  sender: string; // 发送人：用户名（如 @kaige325）或数字 ID（如 12345678）
+  sender: string; // 发送人：单个用户名（如 @kaige325）或数字 ID，或逗号分隔的多个发送人（最多 5 个，如 @DNSHEbot,@kaige325），无空格
   maxCount: number; // 每轮最多转发条数，0 表示不限条数
   lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
   // 回执与记录（通用版）：回执接收人需用 setreceipt 后补设置，未设置时不发 Telegram 回执，只记历史。
@@ -241,6 +241,8 @@ function parseCronFromArgs(
 // 收集转发：发送人识别辅助
 // 依次尝试 senderId?.userId、sender?.id、fromId?.userId；用户名取 sender?.username。
 // 若任务里 sender 是纯数字，则按数字 ID 匹配；否则按用户名匹配（忽略大小写和开头的 @）。
+// 多发送人：sender 可以是逗号分隔的列表（最多 5 个，如 @DNSHEbot,@kaige325），任一匹配即算命中，
+// 这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上，避免整轮无话可转。
 function getMessageSenderId(m: any): number | undefined {
   const candidates = [
     m?.senderId?.userId,
@@ -262,14 +264,30 @@ function getMessageSenderUsername(m: any): string | undefined {
 function matchesSender(m: any, sender: string): boolean {
   const s = String(sender || "").trim();
   if (!s) return false;
-  if (/^-?\d+$/.test(s)) {
-    const want = Number(s);
-    const got = getMessageSenderId(m);
-    return got !== undefined && got === want;
+  // 逗号分隔的多发送人（支持英文逗号和中文逗号），任一匹配即命中；兼容旧的单个发送人任务。
+  const parts = s
+    .split(/[,，]+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  for (const part of parts) {
+    if (/^-?\d+$/.test(part)) {
+      const want = Number(part);
+      const got = getMessageSenderId(m);
+      if (got !== undefined && got === want) return true;
+    } else {
+      const wantName = part.replace(/^@/, "").toLowerCase();
+      const gotName = getMessageSenderUsername(m);
+      if (!!gotName && gotName.toLowerCase() === wantName) return true;
+    }
   }
-  const wantName = s.replace(/^@/, "").toLowerCase();
-  const gotName = getMessageSenderUsername(m);
-  return !!gotName && gotName.toLowerCase() === wantName;
+  return false;
+}
+
+function parseSenderList(sender: string): string[] {
+  return String(sender || "")
+    .split(/[,，]+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
 }
 
 function buildCopy(task: AcronTask): string {
@@ -441,7 +459,7 @@ async function scheduleTask(task: AcronTask) {
           await db.write();
         }
       } else if (task.type === "collect") {
-        // 定时收集转发：到点时拉取来源群最近消息，按发送人过滤，只转发未处理过的新消息。
+        // 定时收集转发：到点时拉取来源群最近消息，按发送人过滤，设了条数时每轮必须转满规定条数，不够就往回找旧消息补足。
         // 本分支不使用实时监听、不新增登录，复用 TeleBox 已登录客户端。
         const t = task as CollectTask;
         const sourceChatIdNum = toInt(t.sourceChatId);
@@ -452,36 +470,97 @@ async function scheduleTask(task: AcronTask) {
         const messages = await safeGetMessages(client, sourceEntityLike as any, {
           limit: 100,
         });
-        // 过滤发送人，按消息 ID 升序（时间顺序）排列
+        // 过滤发送人，按消息 ID 升序（时间顺序）排列，再只留最近 24 小时内的消息。
+        // 2026-11-04 用户定：往回找只找 24 小时内的，超过 24 小时的旧消息不再转；
+        // 24 小时内根本没有该发送人消息时，才算无话可转。
+        // 日期字段缺失时按最近处理，避免因字段缺失误判为过期。
+        const msgTime = (m: any): number => {
+          const d = (m as any)?.date;
+          if (typeof d === "number") return d < 1e12 ? d * 1000 : d;
+          if (d instanceof Date) return d.getTime();
+          if (typeof d === "string") {
+            const p = Date.parse(d);
+            return Number.isNaN(p) ? now : p;
+          }
+          return now;
+        };
         const filtered = ((messages || []) as any[])
           .filter((m) => matchesSender(m, t.sender))
           .filter((m) => typeof m?.id === "number")
+          .filter((m) => msgTime(m) >= now - 24 * 60 * 60 * 1000)
           .sort((a, b) => a.id - b.id);
         // 未处理过的新消息：lastSeenId 未设置时首轮取最近历史，见 help 说明
         const fresh = lastSeen === undefined
           ? filtered
           : filtered.filter((m) => m.id > lastSeen);
-        if (fresh.length === 0) {
+        // 新规则（2026-11-04 用户定）：每轮必须按规定条数转，不能因无新消息就跳过。
+        // maxCount > 0 时：新消息够数就转最新 maxCount 条新消息；新消息不够数，就从定时点往回找，
+        // 用最近的旧消息补足到 maxCount 条；完全没有新消息时，就直接转定时点之前最近的 maxCount 条旧消息。
+        // 这样目标群每轮都会收到规定条数，但旧消息会在多轮里重复出现，这是按规定条数转的必然结果。
+        // maxCount = 0（不限）时仍只转新消息，不回补旧消息，避免每轮重转全部历史。
+        // 只有来源最近 24 小时内完全没有该发送人的消息时，才无法转任何消息，这时仍记跳过，但照样发回执（无话可转）。
+        const toForward =
+          maxCount > 0
+            ? fresh.length >= maxCount
+              ? fresh.slice(-maxCount)
+              : filtered.slice(-maxCount)
+            : fresh;
+        const isFallback = maxCount > 0 && fresh.length < maxCount;
+        if (toForward.length === 0) {
           if (idx >= 0) {
             const storedSkip = db.data.tasks[idx] as CollectTask;
+            // 设了条数时到这里只可能是一种情况：最近 24 小时内完全没有该发送人消息；
+            // 不限条数时到这里可能是无新消息。两种情况现在都发回执，不再静默跳过。
+            const noMsgIn24h = filtered.length === 0;
+            const skipResult = noMsgIn24h
+              ? `无话可转，已跳过`
+              : `暂无新消息，已跳过`;
             db.data.tasks[idx].lastRunAt = String(now);
-            db.data.tasks[idx].lastResult = `暂无新消息，已跳过`;
+            db.data.tasks[idx].lastResult = skipResult;
             db.data.tasks[idx].lastError = undefined;
-            // 只记历史，不发 Telegram 回执，避免无新消息时也打扰所有者
             storedSkip.history = storedSkip.history || [];
             storedSkip.history.push({
               time: String(now),
               count: 0,
               ids: "",
-              result: `暂无新消息，已跳过`,
+              result: skipResult,
             });
             if (storedSkip.history.length > 20)
               storedSkip.history = storedSkip.history.slice(-20);
             await db.write();
+            // 跳过也要发回执（2026-11-04 用户定）：无话可转时回执里写 (无话可转)，让所有者知道这轮跑了但没东西可转。
+            // 回执发送失败不影响本次结果，只记日志。
+            const receiptRawSkip = String(storedSkip.receiptTo || "").trim();
+            const receiptToSkip = toInt(receiptRawSkip);
+            if (receiptRawSkip !== "off" && receiptToSkip !== undefined) try {
+              const runTimeSkip = formatDate(new Date(now));
+              const remarkTextSkip = t.remark ? `任务：${t.remark}\n` : "";
+              const statusTextSkip = noMsgIn24h
+                ? `⚠️ 无话可转`
+                : `ℹ️ 无新消息，已跳过`;
+              const receiptTextSkip =
+                `${statusTextSkip}${
+                  noMsgIn24h ? " (无话可转)" : ""
+                }\n` +
+                `${remarkTextSkip}` +
+                `时间：${runTimeSkip}\n` +
+                `来源：${t.sourceChat} 发送人：${t.sender}\n` +
+                `目标：${t.chat}\n` +
+                `原消息 ID：无\n` +
+                `已处理ID：${storedSkip.lastSeenId || "无"}`;
+              // 无话可转时，(无话可转) 必须出现在回执里。
+              await client.sendMessage(receiptToSkip as any, {
+                message: receiptTextSkip,
+              });
+            } catch (receiptErrSkip: any) {
+              console.error(
+                `[acron] 收集回执发送失败（不影响转发结果）:`,
+                receiptErrSkip,
+              );
+            }
           }
         } else {
-          // maxCount > 0 时只转发最新 maxCount 条；maxCount 为 0 时转发全部新消息（按时间顺序）
-          const toForward = maxCount > 0 ? fresh.slice(-maxCount) : fresh;
+          // maxCount > 0 时按上面规则转规定条数（含回补旧消息）；maxCount 为 0 时转发全部新消息（按时间顺序）
           let lastOkId: number | undefined = undefined;
           let forwarded = 0;
           let failed: any = undefined;
@@ -507,16 +586,34 @@ async function scheduleTask(task: AcronTask) {
             const stored = db.data.tasks[idx] as CollectTask;
             db.data.tasks[idx].lastRunAt = String(now);
             if (failed) {
-              // 失败时只推进到最后一条成功转发的消息，失败消息下一轮重试，不紧循环重试
-              if (lastOkId !== undefined) stored.lastSeenId = String(lastOkId);
+              // 失败时只推进到最后一条成功转发的消息，失败消息下一轮重试，不紧循环重试；
+              // 回补旧消息时不把已处理 ID 往回改，只在新消息成功时才推进。
+              if (
+                lastOkId !== undefined &&
+                fresh.length > 0 &&
+                lastOkId >= fresh[fresh.length - 1].id
+              )
+                stored.lastSeenId = String(lastOkId);
+              else if (
+                lastOkId !== undefined &&
+                fresh.length > 0 &&
+                lastSeen === undefined
+              )
+                stored.lastSeenId = String(lastOkId);
               db.data.tasks[idx].lastResult =
-                forwarded > 0 ? `已转发 ${forwarded} 条，后续失败` : `转发失败`;
+                forwarded > 0
+                  ? `已转发 ${forwarded} 条${isFallback ? "（回补）" : ""}，后续失败`
+                  : `转发失败`;
               db.data.tasks[idx].lastError = String(failed?.message || failed);
             } else {
-              // 成功时把本轮所有新消息的最大 ID 记为已处理。
+              // 成功时：有新消息就把本轮新消息的最大 ID 记为已处理；
+              // 纯回补旧消息时不改已处理 ID，下轮新消息判断仍以原来为准，旧消息下轮还会再被回补。
               // 不限条数时本轮新消息已全部转发，所以这样记不会丢消息。
-              stored.lastSeenId = String(fresh[fresh.length - 1].id);
-              db.data.tasks[idx].lastResult = `已转发 ${forwarded} 条消息`;
+              if (fresh.length > 0)
+                stored.lastSeenId = String(fresh[fresh.length - 1].id);
+              db.data.tasks[idx].lastResult = `已转发 ${forwarded} 条消息${
+                isFallback ? "（回补）" : ""
+              }`;
               db.data.tasks[idx].lastError = undefined;
             }
             // 回执记录：每次有转发或失败都记历史（最近 20 次），与 lastResult 分开保存，
@@ -543,9 +640,13 @@ async function scheduleTask(task: AcronTask) {
               const remarkText = t.remark ? `任务：${t.remark}\n` : "";
               const statusText = failed
                 ? forwarded > 0
-                  ? `⚠️ 收集转发部分成功，已转发 ${forwarded} 条，后续失败`
+                  ? `⚠️ 收集转发部分成功，已转发 ${forwarded} 条${
+                      isFallback ? "（回补）" : ""
+                    }，后续失败`
                   : `❌ 收集转发失败`
-                : `✅ 收集转发成功，已转发 ${forwarded} 条`;
+                : `✅ 收集转发成功，已转发 ${forwarded} 条${
+                    isFallback ? "（回补）" : ""
+                  }`;
               const receiptText =
                 `${statusText}\n` +
                 `${remarkText}` +
@@ -675,7 +776,7 @@ const help_text = `▎定时复制
 
 ▎定时收集转发
 
-到点时从来源群拉取最近 100 条消息，只挑指定发送人的新消息，按时间顺序转发到目标群。无新消息则跳过，不重复转发旧消息。首轮没有已处理记录时，转发最近历史里的新消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
+到点时从来源群拉取最近 100 条消息，只挑指定发送人的消息，按时间顺序转发到目标群。发送人可以写多个，最多 5 个，用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325，任一发送人的消息都算数，这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上。设了每轮条数时，每轮必须转满规定条数（条数是所有发送人加起来的总数，不是每人几条）：新消息够数就转最新那几条新消息，新消息不够数就从定时点往回找，用最近 24 小时内的旧消息补足，完全没有新消息时就直接转定时点之前最近 24 小时内的几条旧消息（旧消息会在多轮里重复出现）。只有最近 24 小时内所有发送人都没有消息时，才无法转发，这时也照样发回执，写 (无话可转)。首轮没有已处理记录时，转发最近历史里的消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
 
 • 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数）
 • 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条）
@@ -683,7 +784,7 @@ const help_text = `▎定时复制
 
 上面两条分别对应显示时间 08:00 和 12:30（按本插件已有任务的规律：显示 09:00 对应 cron 0 0 2，显示 06:00 对应 cron 0 0 23，显示 13:00 对应 cron 0 0 6，所以显示 08:00 写 cron 0 0 1，显示 12:30 写 cron 0 30 5）。添加后请以 <code>${mainPrefix}acron ls all</code> 显示的下次时间为准，不要只看 cron 数字。
 
-规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；没有新消息就跳过；发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务。
+规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；设了条数时每轮必须转满该条数，没有新消息或新消息不够数时就往回找最近 24 小时内的旧消息补足（会重复转发旧消息）；不设条数（不限）时只转新消息，不回补；最近 24 小时内所有发送人都没有消息时，无法转发但照样发回执 (无话可转)。发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务；发送人最多 5 个，用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325，超过 5 个建任务时会直接报错。
 
 • 回执设置：<code>${mainPrefix}acron setreceipt 任务ID 接收人数字ID</code>，例如 <code>${mainPrefix}acron setreceipt 9 123456789</code>；<code>${mainPrefix}acron setreceipt all 123456789</code> 改全部收集任务；<code>${mainPrefix}acron setreceipt 9 off</code> 关闭 Telegram 回执（只记历史）；不写接收人就是查看当前设置。未设置回执 ID 时不发 Telegram 回执，只记历史；用 setreceipt 设了之后，才发给指定 ID。
 
@@ -743,7 +844,7 @@ ${mainPrefix}eat set</pre>
 • <code>${mainPrefix}acron ls all</code>, <code>${mainPrefix}acron la</code> - 列出所有的定时任务
 • <code>${mainPrefix}acron ls del</code> - 列出当前会话中的类型为 del 的定时任务
 • <code>${mainPrefix}acron ls all del</code>, <code>${mainPrefix}acron la del</code> - 列出所有的类型为 del 的定时任务
-• <code>${mainPrefix}acron rm 定时任务ID</code> - 删除指定的定时任务
+• <code>${mainPrefix}acron rm 定时任务ID</code> - 删除指定的定时任务，一次删多个请用空格分隔，例如 <code>${mainPrefix}acron rm 7 8 9 10 11</code>，只删其中一个就只写一个 ID，例如 <code>${mainPrefix}acron rm 7</code>
 • <code>${mainPrefix}acron disable/off 定时任务ID</code> - 禁用指定的定时任务
 • <code>${mainPrefix}acron enable/on 定时任务ID</code> - 启用指定的定时任务
 `;
@@ -1030,29 +1131,65 @@ class AcronPlugin extends Plugin {
         }
 
         if (sub === "rm") {
-          const id = args[1];
-          if (!id) {
+          // 批量删除：.acron rm 7 8 9 10 11 一次删多个，也兼容旧的单个 .acron rm 7。
+          // 多个 ID 之间用空格分隔，也支持逗号分隔（如 .acron rm 7,8,9）。
+          // 删错一个不影响其他：找不到的 ID 只报告未找到，不中断整批。
+          const ids = args
+            .slice(1)
+            .flatMap((a: string) => String(a).split(/[,，]+/))
+            .map((a: string) => a.trim())
+            .filter(Boolean);
+          // 去重，保留第一次出现的顺序
+          const uniqueIds = [...new Set(ids)];
+          if (uniqueIds.length === 0) {
             await msg.edit({
-              text: `请提供定时任务ID: <code>${mainPrefix}acron rm ID</code>`,
+              text: `请提供定时任务ID: <code>${mainPrefix}acron rm ID</code>，一次删多个请用空格分隔，例如 <code>${mainPrefix}acron rm 7 8 9 10 11</code>`,
               parseMode: "html",
             });
             return;
           }
           const db = await getDB();
-          const idx = db.data.tasks.findIndex((t) => t.id === id);
-          if (idx < 0) {
+          const deleted: string[] = [];
+          const notFound: string[] = [];
+          for (const id of uniqueIds) {
+            const idx = db.data.tasks.findIndex((t) => t.id === id);
+            if (idx < 0) {
+              notFound.push(id);
+              continue;
+            }
+            const remark = db.data.tasks[idx].remark
+              ? ` ${db.data.tasks[idx].remark}`
+              : "";
+            const key = makeCronKey(id);
+            cronManager.del(key);
+            db.data.tasks.splice(idx, 1);
+            deleted.push(`${id}${remark}`);
+          }
+          if (deleted.length > 0) await db.write();
+          if (deleted.length === 1 && notFound.length === 0) {
+            // 单个删除时保持旧回复格式不变
+            const onlyId = uniqueIds[0];
             await msg.edit({
-              text: `未找到任务: <code>${id}</code>`,
+              text: `✅ 已删除任务 <code>${onlyId}</code>`,
               parseMode: "html",
             });
             return;
           }
-          const key = makeCronKey(id);
-          cronManager.del(key);
-          db.data.tasks.splice(idx, 1);
-          await db.write();
+          const lines: string[] = [];
+          if (deleted.length > 0)
+            lines.push(
+              `✅ 已删除任务: ${deleted
+                .map((d) => `<code>${d}</code>`)
+                .join("，")}`,
+            );
+          if (notFound.length > 0)
+            lines.push(
+              `未找到任务: ${notFound
+                .map((d) => `<code>${d}</code>`)
+                .join("，")}`,
+            );
           await msg.edit({
-            text: `✅ 已删除任务 <code>${id}</code>`,
+            text: lines.join("\n"),
             parseMode: "html",
           });
           return;
@@ -1488,6 +1625,18 @@ class AcronPlugin extends Plugin {
             }
             if (!senderArg) {
               await msg.edit({ text: "请提供发送人用户名或数字ID，例如 @kaige325" });
+              return;
+            }
+            // 多发送人：逗号分隔、无空格，最多 5 个，例如 @DNSHEbot,@kaige325
+            const senderList = parseSenderList(senderArg);
+            if (senderList.length === 0) {
+              await msg.edit({ text: "发送人不能为空" });
+              return;
+            }
+            if (senderList.length > 5) {
+              await msg.edit({
+                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再建，多个发送人之间用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325`,
+              });
               return;
             }
             // 可选条数：发送人后面紧跟一个纯数字时当作每轮条数（0 表示不限），
