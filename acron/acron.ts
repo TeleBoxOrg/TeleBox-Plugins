@@ -52,6 +52,9 @@ type AcronTaskBase = {
   disabled?: boolean; // 是否被禁用
   remark?: string; // 备注
   display?: string; // 显示名称
+  // 回执（所有定时任务通用，2026-11-06 用户定）：回执接收人需用 setreceipt 后补设置，
+  // 未设置或设为 off 时不发 Telegram 回执；设了才发给指定 ID，不发到目标群和来源群。
+  receiptTo?: string; // 回执接收人数字 ID（字符串），未设置 = 不发回执
 };
 
 type DelTask = AcronTaskBase & {
@@ -115,9 +118,7 @@ type CollectTask = AcronTaskBase & {
   sender: string; // 发送人：单个用户名（如 @kaige325）或数字 ID，或逗号分隔的多个发送人（最多 5 个，如 @DNSHEbot,@kaige325），无空格；写一个 * 或不写发送人，都表示任意真人用户（机器人除外，只看定时点之前、由近到远不限时间找，不回补已转过的旧消息）
   maxCount: number; // 每轮最多转发条数，0 表示不限条数
   lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
-  // 回执与记录（通用版）：回执接收人需用 setreceipt 后补设置，未设置时不发 Telegram 回执，只记历史。
-  // 设了才发给指定 ID，不发到目标群和来源群。
-  receiptTo?: string; // 回执接收人数字 ID（字符串），未设置 = 不发回执
+  // 回执接收人在基类 AcronTaskBase.receiptTo（所有定时任务通用），这里只留历史记录。
   history?: Array<{
     time: string; // 时间戳（字符串）
     count: number; // 本轮转发成功条数
@@ -141,11 +142,27 @@ type AcronTask =
 type AcronDB = {
   seq: string; // 自增计数器（字符串）
   tasks: AcronTask[];
+  // 默认回执接收人（2026-11-06 用户定）：setreceipt all 设一次后，新建任务自动带上，不用再设。
+  // 未设置 = 新任务默认不发回执；off = 新任务默认不发。
+  defaultReceiptTo?: string;
 };
 
 async function getDB() {
   const db = await JSONFilePreset<AcronDB>(filePath, { seq: "0", tasks: [] });
   return db;
+}
+
+// 新任务默认回执：优先用 setreceipt all 存下的 defaultReceiptTo；
+// 还没存过时，兜底用已有任务里最近一个设过的回执（比如 16/20 号已有的 8404276696），
+// 这样装新版后不用先设一次也能自动带上；两者都没有时新任务不发回执。
+function getDefaultReceiptTo(db: { data: AcronDB }): string | undefined {
+  const saved = String((db.data as any).defaultReceiptTo || "").trim();
+  if (saved) return saved;
+  for (let i = db.data.tasks.length - 1; i >= 0; i--) {
+    const cur = String((db.data.tasks[i] as any).receiptTo || "").trim();
+    if (cur && cur !== "off") return cur;
+  }
+  return undefined;
 }
 
 // 转换辅助：在使用时将字符串转 number，写入时存字符串
@@ -392,6 +409,89 @@ function tryParseRegex(input: string): RegExp {
   return new RegExp(trimmed);
 }
 
+// 通用回执（2026-11-06 用户定）：所有定时任务跑完都发回执，不只收集转发。
+// 收集任务不用这个函数，它有自己的回执（含来源/原消息 ID/回补标记/无话可转），避免重复发两条。
+// 未设置 receiptTo 或设为 off 时不发；回执发送失败只记日志，绝不抛错、不影响任务结果本身。
+const TASK_TYPE_LABEL: Record<string, string> = {
+  send: "发送",
+  cmd: "命令",
+  copy: "复制",
+  forward: "转发",
+  del: "删除",
+  del_re: "正则删除",
+  pin: "置顶",
+  unpin: "取消置顶",
+  collect: "收集转发",
+};
+
+// 回执里的对话只写 ID 看不出是哪个群/人，查一下名字一起显示；查不到就只写 ID，回执照样发。
+async function getChatDisplay(
+  client: any,
+  lookupTarget: any,
+  fallback: any,
+): Promise<string> {
+  const raw = String(fallback ?? lookupTarget ?? "").trim();
+  try {
+    if (!client || lookupTarget === undefined || lookupTarget === null || lookupTarget === "") return raw;
+    const entity = await client.getEntity(lookupTarget);
+    const title = (entity as any)?.title;
+    const firstName = (entity as any)?.firstName;
+    const lastName = (entity as any)?.lastName;
+    const username = (entity as any)?.username;
+    const name =
+      title ||
+      [firstName, lastName].filter(Boolean).join(" ").trim() ||
+      (username ? `@${username}` : "");
+    if (!name) return raw;
+    return name === raw ? raw : `${name} (${raw})`;
+  } catch {
+    return raw;
+  }
+}
+
+async function sendTaskReceipt(
+  client: any,
+  task: AcronTask,
+  runAt: number,
+  ok: boolean,
+  result?: string,
+  error?: string,
+) {
+  const raw = String((task as any).receiptTo || "").trim();
+  if (!raw || raw === "off") return;
+  const to = toInt(raw);
+  if (to === undefined) return;
+  try {
+    const label = TASK_TYPE_LABEL[task.type] || task.type;
+    const remarkText = task.remark ? `任务：${task.remark}\n` : "";
+    const chatDisplay = await getChatDisplay(
+      client,
+      (task as any).chatId ?? task.chat,
+      task.chat,
+    );
+    // 回执里只写任务名分不出是哪个任务发的：两个发送任务同秒跑到同一个群时，
+    // 光看回执不知道图里那条是谁发的。发送/命令任务把存的消息内容前 60 字也写进回执，
+    // 一眼就能对上是哪条；其他类型没有存文本，不写这一行。
+    const contentPreview =
+      (task.type === "send" || task.type === "cmd") &&
+      (task as any).message
+        ? String((task as any).message).replace(/\s+/g, " ").trim().slice(0, 60)
+        : "";
+    const text =
+      `${ok ? "✅ 定时任务已执行" : "❌ 定时任务执行失败"}\n` +
+      `${remarkText}` +
+      `任务ID：${task.id} 类型：${label}\n` +
+      `时间：${formatDate(new Date(runAt))}\n` +
+      `对话：${chatDisplay}\n` +
+      (contentPreview ? `内容：${contentPreview}\n` : "") +
+      `结果：${result || (ok ? "已执行" : "执行失败")}` +
+      (error ? `\n错误：${error}` : "");
+    await client.sendMessage(to as any, { message: text });
+  } catch (err: any) {
+    console.error("[acron] 回执发送失败（不影响任务结果）:", err);
+  }
+}
+
 async function scheduleTask(task: AcronTask) {
   const key = makeCronKey(task.id);
   if (task.disabled) return;
@@ -400,6 +500,11 @@ async function scheduleTask(task: AcronTask) {
   cronManager.set(key, task.cron, async () => {
     const db = await getDB();
     const idx = db.data.tasks.findIndex((t) => t.id === task.id);
+    // 每次运行前先从 DB 同步最新任务：edit 改目标/来源/发送人/条数/备注后，
+    // 旧闭包里的 task 对象不会自动变（getDB 每次都是新对象），不做同步的话
+    // 列表显示新值、实际跑的还是旧值；已处理 ID 也是同理，跑完只写 DB 不回写闭包，
+    // 下轮会把已转过的消息再当新消息转一遍。
+    if (idx >= 0) Object.assign(task, db.data.tasks[idx]);
     const now = Date.now();
     try {
       const client = await getGlobalClient();
@@ -593,14 +698,24 @@ async function scheduleTask(task: AcronTask) {
               const statusTextSkip = noMsgIn24h
                 ? `⚠️ 无话可转`
                 : `ℹ️ 无新消息，已跳过`;
+              const sourceDisplaySkip = await getChatDisplay(
+                client,
+                (t as any).sourceChatId ?? t.sourceChat,
+                t.sourceChat,
+              );
+              const targetDisplaySkip = await getChatDisplay(
+                client,
+                (t as any).chatId ?? t.chat,
+                t.chat,
+              );
               const receiptTextSkip =
                 `${statusTextSkip}${
                   noMsgIn24h ? " (无话可转)" : ""
                 }\n` +
                 `${remarkTextSkip}` +
                 `时间：${runTimeSkip}\n` +
-                `来源：${t.sourceChat} 发送人：${t.sender}\n` +
-                `目标：${t.chat}\n` +
+                `来源：${sourceDisplaySkip} 发送人：${t.sender}\n` +
+                `目标：${targetDisplaySkip}\n` +
                 `原消息 ID：无\n` +
                 `已处理ID：${storedSkip.lastSeenId || "无"}`;
               // 无话可转时，(无话可转) 必须出现在回执里。
@@ -702,12 +817,22 @@ async function scheduleTask(task: AcronTask) {
                 : `✅ 收集转发成功，已转发 ${forwarded} 条${
                     isFallback ? "（回补）" : ""
                   }`;
+              const sourceDisplay = await getChatDisplay(
+                client,
+                (t as any).sourceChatId ?? t.sourceChat,
+                t.sourceChat,
+              );
+              const targetDisplay = await getChatDisplay(
+                client,
+                (t as any).chatId ?? t.chat,
+                t.chat,
+              );
               const receiptText =
                 `${statusText}\n` +
                 `${remarkText}` +
                 `时间：${runTime}\n` +
-                `来源：${t.sourceChat} 发送人：${t.sender}\n` +
-                `目标：${t.chat}\n` +
+                `来源：${sourceDisplay} 发送人：${t.sender}\n` +
+                `目标：${targetDisplay}\n` +
                 `原消息 ID：${forwardedIds.join(",") || "无"}\n` +
                 (failed
                   ? `错误：${String(failed?.message || failed)}\n`
@@ -787,12 +912,47 @@ async function scheduleTask(task: AcronTask) {
           await db.write();
         }
       }
+      // 通用回执（成功）：非收集任务跑完发一条；收集任务上面已自己发过回执，这里跳过，避免重复发两条。
+      // 未设置 receiptTo 或设为 off 时 sendTaskReceipt 内部直接返回，不发。
+      if (task.type !== "collect") {
+        const stored = idx >= 0 ? db.data.tasks[idx] : task;
+        await sendTaskReceipt(
+          client,
+          stored,
+          now,
+          !stored.lastError,
+          stored.lastResult,
+          stored.lastError,
+        );
+      }
     } catch (e: any) {
       console.error(`[acron] 任务 ${task.id} 执行失败:`, e);
       if (idx >= 0) {
         db.data.tasks[idx].lastRunAt = String(now);
         db.data.tasks[idx].lastError = String(e?.message || e);
         await db.write();
+      }
+      // 通用回执（失败）：非收集任务失败也发一条；收集任务上面已自己发过回执（失败时还会 throw 到这里），这里跳过，避免重复。
+      if (task.type !== "collect") {
+        try {
+          const failClient = await getGlobalClient();
+          if (failClient) {
+            const stored = idx >= 0 ? db.data.tasks[idx] : task;
+            await sendTaskReceipt(
+              failClient,
+              stored,
+              now,
+              false,
+              stored.lastResult,
+              String(e?.message || e),
+            );
+          }
+        } catch (receiptErr: any) {
+          console.error(
+            "[acron] 回执发送失败（不影响任务结果）:",
+            receiptErr,
+          );
+        }
       }
     }
   });
@@ -815,7 +975,9 @@ async function bootstrapTasks() {
 // 启动时注册历史任务（异步，不阻塞加载）
 bootstrapTasks();
 
-const help_text = `▎定时复制
+const help_text = `⚠️ 定制版（非官方）：已覆盖远程官方插件，若需恢复官方，请 ${mainPrefix}tpm i acron
+
+▎定时复制
 
 每天2点复制发送到指定对话(可指定话题或回复消息)
 
@@ -831,22 +993,39 @@ const help_text = `▎定时复制
 
 ▎定时收集转发
 
-到点时从来源群拉取最近 100 条消息，只挑指定发送人的消息，按时间顺序转发到目标群。发送人可以写多个，最多 5 个，用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325，任一发送人的消息都算数，这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上；发送人不写就是任意真人用户，见下面任意用户模式，那个模式不限时间、不回补旧消息。设了每轮条数时，每轮必须转满规定条数（条数是所有发送人加起来的总数，不是每人几条）：新消息够数就转最新那几条新消息，新消息不够数就从定时点往回找，用最近 24 小时内的旧消息补足，完全没有新消息时就直接转定时点之前最近 24 小时内的几条旧消息（旧消息会在多轮里重复出现）。只有最近 24 小时内所有发送人都没有消息时，才无法转发，这时也照样发回执，写 (无话可转)。首轮没有已处理记录时，转发最近历史里的消息。本功能复用 TeleBox 已登录的客户端，不需要新的登录、API ID、Bot Token 或密码。
+到点从来源群最近 100 条里，挑指定发送人的消息按时间顺序转到目标群。
 
-• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数）
-• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条）
-• 发送人后面紧跟一个纯数字就是每轮条数，不写就是不限；注意设了条数时，只转最新那几条，更旧的新消息会被记为已处理、之后不再补发。
+• 用法：<code>${mainPrefix}acron collect <6段cron> <目标> <来源> <发送人> [条数] [备注]</code>
+• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数，显示 08:00）
+• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条，显示 12:30）
+• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1002443712513 -1003219886860 * 2 任意用户收集12点</code>（任意真人用户，12:00 那轮转最新 2 条）
+• 时间：显示时间 = cron 小时 + 7，以 <code>${mainPrefix}acron ls all</code> 的下次时间为准。
+• 发送人：用户名或数字 ID，最多 5 个，英文逗号连、不要空格，如 @DNSHEbot,@kaige325；不写或写 * 就是任意真人用户，机器人除外。备注是纯英文单词时容易被误当发送人，不指定发送人时先写 * 或条数。
+• 条数：发送人后跟数字就是每轮条数，不写不限，条数是所有发送人加起来的总数。指定发送人时不够数会往回找最近 24 小时内的旧消息补足（会重复）；任意用户模式只转新消息，不回补，没新消息就跳过。没消息也照样发回执。
+• 首轮没有已处理记录时，转最近历史里的消息。
+• 回执：见下一节。
 
-上面两条分别对应显示时间 08:00 和 12:30（按本插件已有任务的规律：显示 09:00 对应 cron 0 0 2，显示 06:00 对应 cron 0 0 23，显示 13:00 对应 cron 0 0 6，所以显示 08:00 写 cron 0 0 1，显示 12:30 写 cron 0 30 5）。添加后请以 <code>${mainPrefix}acron ls all</code> 显示的下次时间为准，不要只看 cron 数字。
 
-规则：每轮条数可自定（发送人后写数字，如 2、4，不写则不限）；设了条数时每轮必须转满该条数，没有新消息或新消息不够数时就往回找最近 24 小时内的旧消息补足（会重复转发旧消息）；不设条数（不限）时只转新消息，不回补；最近 24 小时内所有发送人都没有消息时，无法转发但照样发回执 (无话可转)。发送人可用用户名（如 @kaige325）或数字 ID，用户名改名后请改用数字 ID 并重建任务；发送人最多 5 个，用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325，超过 5 个建任务时会直接报错。
+▎回执（设一次，新任务自动带）
 
-任意用户模式：发送人不写就是任意真人用户，写一个 <code>*</code> 也是任意真人用户，群里任意真人用户说话都转，机器人发的消息除外（包括 @DNSHEbot，机器人判断看消息的 sender.bot）。这个模式和指定发送人任务是分开的：指定发送人任务仍按上面的 24 小时回补规则走，任意用户模式不走回补——只看定时点之前的消息，在来源群最近 100 条里由近到远不限时间找，离定时点最近的先算，按每轮条数转最新的几条新消息（转发时仍按时间顺序发）；新消息不够数也不拿旧消息凑，没有新消息就跳过并照样发回执 (无话可转/暂无新消息)，不把已经转过的旧消息翻出来再转。想同时要机器人消息就保留原来的 @DNSHEbot,@kaige325 任务。
-• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1002443712513 -1003219886860 * 2 任意用户收集12点</code>（12:00 那轮，只转定时点之前离 12:00 最近的真人用户发的最新 2 条，不限时间往回找，机器人除外，不回补旧消息）
-• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1002443712513 -1003219886860 2 任意用户收集12点</code>（和上一条一样：发送人位置直接写条数 2，就表示不指定发送人、任意用户；发送人位置的小数字当条数，大数字才当数字 ID 发送人）
-• 注意：备注如果是纯英文/数字下划线单词，容易被误当成发送人，不指定发送人时建议写 <code>*</code> 或先写条数，不要只写一个英文备注词。
+所有定时任务通用，不只收集转发。发送/命令/复制/转发/删除/置顶/收集，跑完（成功或失败）都发一条回执到指定 ID，不发到目标群和来源群；没设就不发，只在 <code>${mainPrefix}acron ls all</code> 里看结果。回执发送失败不影响任务本身。
 
-• 回执设置：<code>${mainPrefix}acron setreceipt 任务ID 接收人数字ID</code>，例如 <code>${mainPrefix}acron setreceipt 9 123456789</code>；<code>${mainPrefix}acron setreceipt all 123456789</code> 改全部收集任务；<code>${mainPrefix}acron setreceipt 9 off</code> 关闭 Telegram 回执（只记历史）；不写接收人就是查看当前设置。未设置回执 ID 时不发 Telegram 回执，只记历史；用 setreceipt 设了之后，才发给指定 ID。
+第 1 步，设一次默认回执（123456789 换成你要收回执的数字 ID）：
+• <code>${mainPrefix}acron setreceipt all 123456789</code>
+这条会把现有任务全改掉，同时把这个接收人存为默认。
+
+第 2 步，以后新建任务不用再设，建完自动带上，例如：
+• <code>${mainPrefix}acron send 0 0 2 * * * 对话ID/@name 备注</code>（回复一条消息）
+• <code>${mainPrefix}acron collect 0 0 5 * * * -1002443712513 -1003219886860 * 1 备注</code>
+
+第 3 步，核对：
+• <code>${mainPrefix}acron ls all</code>，新任务下面直接显示 <code>回执: 123456789</code>
+
+• 想换默认：再发一次 <code>${mainPrefix}acron setreceipt all 新ID</code>，以后新建的跟新的走，已建好的不会自动变，改它们再发一次 all。
+• 只改某一个：<code>${mainPrefix}acron setreceipt 9 123456789</code>，只改 9 号，不动默认。
+• 关掉某一个：<code>${mainPrefix}acron setreceipt 9 off</code>
+• 只看不改：<code>${mainPrefix}acron setreceipt 9</code> 或 <code>${mainPrefix}acron setreceipt all</code>
+• 还没存过默认时，新建任务会兜底用已有任务里最近一个设过的回执。
 
 ▎定时发送
 
@@ -905,7 +1084,21 @@ ${mainPrefix}eat set</pre>
 • <code>${mainPrefix}acron ls del</code> - 列出当前会话中的类型为 del 的定时任务
 • <code>${mainPrefix}acron ls all del</code>, <code>${mainPrefix}acron la del</code> - 列出所有的类型为 del 的定时任务
 • <code>${mainPrefix}acron rm 定时任务ID</code> - 删除指定的定时任务，一次删多个请用空格分隔，例如 <code>${mainPrefix}acron rm 7 8 9 10 11</code>，只删其中一个就只写一个 ID，例如 <code>${mainPrefix}acron rm 7</code>
-• <code>${mainPrefix}acron edit 定时任务ID time 0 0 13 * * *</code> - 直接改任务，不用删了重建：改时间用 time（或 cron），改目标用 target/chat，改备注用 remark；收集任务还能改 source/sender/count；改来源会清空已处理ID（旧来源的消息 ID 对新来源没有意义），其他改动保留 ID、历史、回执和已处理ID；消息内容和源消息不能用 edit 改，仍需删了重建
+▎直接改任务（edit，不用删了重建）
+
+一次只改一个字段，一条一条发。只发 <code>${mainPrefix}acron edit 任务号</code> 就是只看当前字段，不改。
+
+• 改时间：<code>${mainPrefix}acron edit 16 time 0 0 13 * * *</code>（改成 20:00，显示时间 = cron 小时 + 7）
+• 改目标：<code>${mainPrefix}acron edit 16 target -1002443712513</code>
+• 改备注：<code>${mainPrefix}acron edit 16 remark 新备注</code>，写 - 就是清空：<code>${mainPrefix}acron edit 16 remark -</code>
+• 收集任务改来源：<code>${mainPrefix}acron edit 16 source -1003219886860</code>（改来源会清空已处理 ID）
+• 收集任务改发送人：<code>${mainPrefix}acron edit 16 sender *</code>（* = 任意真人用户，最多 5 个，英文逗号连）
+• 收集任务改条数：<code>${mainPrefix}acron edit 16 count 1</code>（0 = 不限）
+• 只看：<code>${mainPrefix}acron edit 16</code>
+
+改完保留任务号、历史、回执和已处理 ID（改来源除外）。消息内容和源消息不能用 edit 改，仍需删了重建。改完用 <code>${mainPrefix}acron ls all</code> 核对。
+
+• <code>${mainPrefix}acron edit 定时任务ID 字段 新值</code> - 见上面“直接改任务”一节。
 • <code>${mainPrefix}acron disable/off 定时任务ID</code> - 禁用指定的定时任务
 • <code>${mainPrefix}acron enable/on 定时任务ID</code> - 启用指定的定时任务
 `;
@@ -1054,15 +1247,6 @@ class AcronPlugin extends Plugin {
                 if (ct.lastSeenId) {
                   lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
                 }
-                lines.push(
-                  `回执: ${
-                    ct.receiptTo
-                      ? ct.receiptTo === "off"
-                        ? "已关闭"
-                        : `<code>${ct.receiptTo}</code>`
-                      : "未设置（不发回执）"
-                  }`,
-                );
                 if (ct.history && ct.history.length > 0) {
                   const recent = ct.history.slice(-3);
                   lines.push(
@@ -1077,6 +1261,16 @@ class AcronPlugin extends Plugin {
                   );
                 }
               }
+              // 回执：所有定时任务通用，未设置 = 不发回执
+              lines.push(
+                `回执: ${
+                  t.receiptTo
+                    ? t.receiptTo === "off"
+                      ? "已关闭"
+                      : `<code>${t.receiptTo}</code>`
+                    : "未设置（不发回执）"
+                }`,
+              );
               const msgId = (t as any)?.msgId;
               const fromChatId = (t as any)?.fromChatId;
               const fromMsgId = (t as any)?.fromMsgId;
@@ -1159,6 +1353,15 @@ class AcronPlugin extends Plugin {
                   lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
                 }
               }
+              lines.push(
+                `回执: ${
+                  t.receiptTo
+                    ? t.receiptTo === "off"
+                      ? "已关闭"
+                      : `<code>${t.receiptTo}</code>`
+                    : "未设置（不发回执）"
+                }`,
+              );
               // 禁用状态不显示下次执行
               if (t.lastRunAt) {
                 lines.push(
@@ -1229,9 +1432,9 @@ class AcronPlugin extends Plugin {
               );
               if (ct.lastSeenId)
                 cur.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
-              if (ct.receiptTo)
-                cur.push(`回执: <code>${ct.receiptTo}</code>`);
             }
+            if (t.receiptTo)
+              cur.push(`回执: <code>${t.receiptTo}</code>`);
             cur.push(`备注: ${t.remark || "（无）"}`);
             cur.push("");
             cur.push(usage);
@@ -1330,6 +1533,9 @@ class AcronPlugin extends Plugin {
             const oldRemark = t.remark || "（无）";
             t.remark = joined === "-" ? undefined : joined;
             await db.write();
+            // 重新排程：否则下次运行的闭包还是旧备注，回执里显示旧名字。
+            cronManager.del(makeCronKey(id));
+            if (!t.disabled) await scheduleTask(t as AcronTask);
             await msg.edit({
               text: [
                 `✅ 已修改任务 <code>${id}</code> 的备注`,
@@ -1360,6 +1566,9 @@ class AcronPlugin extends Plugin {
               : undefined;
             if (display) t.display = display;
             await db.write();
+            // 重新排程：只写 DB 的话，下次运行的闭包还是旧目标（列表显示新值、实际跑旧值）。
+            cronManager.del(makeCronKey(id));
+            if (!t.disabled) await scheduleTask(t as AcronTask);
             await msg.edit({
               text: [
                 `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的目标`,
@@ -1382,6 +1591,9 @@ class AcronPlugin extends Plugin {
             const hadLastSeen = !!ct.lastSeenId;
             ct.lastSeenId = undefined;
             await db.write();
+            // 重新排程：只写 DB 的话，下次运行的闭包还是旧来源。
+            cronManager.del(makeCronKey(id));
+            if (!t.disabled) await scheduleTask(t as AcronTask);
             await msg.edit({
               text: [
                 `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的来源`,
@@ -1419,6 +1631,9 @@ class AcronPlugin extends Plugin {
             }
             ct.sender = value;
             await db.write();
+            // 重新排程：只写 DB 的话，下次运行的闭包还是旧发送人。
+            cronManager.del(makeCronKey(id));
+            if (!t.disabled) await scheduleTask(t as AcronTask);
             await msg.edit({
               text: [
                 `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的发送人`,
@@ -1443,6 +1658,9 @@ class AcronPlugin extends Plugin {
             const oldCount = ct.maxCount;
             ct.maxCount = Number(value);
             await db.write();
+            // 重新排程：只写 DB 的话，下次运行的闭包还是旧条数。
+            cronManager.del(makeCronKey(id));
+            if (!t.disabled) await scheduleTask(t as AcronTask);
             await msg.edit({
               text: [
                 `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的每轮条数`,
@@ -1525,16 +1743,15 @@ class AcronPlugin extends Plugin {
           const target = args[2];
           if (!id) {
             await msg.edit({
-              text: `用法: <code>${mainPrefix}acron setreceipt 任务ID 接收人数字ID</code>\n例如: <code>${mainPrefix}acron setreceipt 9 123456789</code>\n全部收集任务: <code>${mainPrefix}acron setreceipt all 123456789</code>\n关闭 Telegram 回执（只记历史）: <code>${mainPrefix}acron setreceipt 9 off</code>\n只看当前设置: <code>${mainPrefix}acron setreceipt 9</code>`,
+              text: `用法: <code>${mainPrefix}acron setreceipt 任务ID 接收人数字ID</code>\n例如: <code>${mainPrefix}acron setreceipt 9 123456789</code>\n全部定时任务: <code>${mainPrefix}acron setreceipt all 123456789</code>\n关闭 Telegram 回执: <code>${mainPrefix}acron setreceipt 9 off</code>\n只看当前设置: <code>${mainPrefix}acron setreceipt 9</code>\n所有定时任务通用（发送/命令/复制/转发/删除/置顶/收集），未设置回执 ID 时不发回执\n设一次就够了：<code>${mainPrefix}acron setreceipt all 123456789</code> 会把这个接收人存为默认，以后新建的定时任务自动带上，不用再设；想换默认就再发一次 all`,
               parseMode: "html",
             });
             return;
           }
           const db = await getDB();
           const applyReceipt = (t: AcronTask): string | null => {
-            if (t.type !== "collect") return null;
             if (!target) {
-              const cur = (t as CollectTask).receiptTo;
+              const cur = (t as AcronTask).receiptTo;
               return cur
                 ? cur === "off"
                   ? "已关闭"
@@ -1542,27 +1759,36 @@ class AcronPlugin extends Plugin {
                 : "未设置（不发回执）";
             }
             if (target === "off") {
-              (t as CollectTask).receiptTo = "off";
+              (t as AcronTask).receiptTo = "off";
               return "已关闭";
             }
             if (!/^-?\d+$/.test(target)) return "无效";
-            (t as CollectTask).receiptTo = String(Number(target));
+            (t as AcronTask).receiptTo = String(Number(target));
             return String(Number(target));
           };
           if (id === "all") {
-            const collectTasks = db.data.tasks.filter(
-              (t) => t.type === "collect",
-            );
-            if (collectTasks.length === 0) {
+            const allTasks = db.data.tasks;
+            if (allTasks.length === 0) {
+              // 还没有任何任务时也可以先设默认回执：以后新建任务自动带上，不用再设。
+              if (target && (target === "off" || /^-?\d+$/.test(target))) {
+                db.data.defaultReceiptTo =
+                  target === "off" ? "off" : String(Number(target));
+                await db.write();
+                await msg.edit({
+                  text: `✅ 已设置默认回执接收人: <code>${target}</code>，以后新建的定时任务自动带上，不用再设`,
+                  parseMode: "html",
+                });
+                return;
+              }
               await msg.edit({
-                text: `没有收集转发任务`,
+                text: `没有定时任务`,
                 parseMode: "html",
               });
               return;
             }
             if (!target) {
-              const lines = collectTasks.map((t) => {
-                const cur = (t as CollectTask).receiptTo;
+              const lines = allTasks.map((t) => {
+                const cur = (t as AcronTask).receiptTo;
                 const show = cur
                   ? cur === "off"
                     ? "已关闭"
@@ -1571,7 +1797,7 @@ class AcronPlugin extends Plugin {
                 return `<code>${t.id}</code> ${t.remark || ""} 回执: ${show}`;
               });
               await msg.edit({
-                text: `收集任务回执设置:\n${lines.join("\n")}`,
+                text: `定时任务回执设置:\n${lines.join("\n")}`,
                 parseMode: "html",
               });
               return;
@@ -1583,10 +1809,14 @@ class AcronPlugin extends Plugin {
               });
               return;
             }
-            for (const t of collectTasks) applyReceipt(t);
+            for (const t of allTasks) applyReceipt(t);
+            // 默认回执（2026-11-06 用户定）：setreceipt all 设一次后，以后新建任务自动带上这个接收人，不用再设；
+            // 改默认只改以后新建的，已有任务这次已经一起改了。单个任务的 setreceipt 只改那一个，不动默认。
+            db.data.defaultReceiptTo =
+              target === "off" ? "off" : String(Number(target));
             await db.write();
             await msg.edit({
-              text: `✅ 已设置全部 ${collectTasks.length} 个收集任务的回执接收人: <code>${target}</code>`,
+              text: `✅ 已设置全部 ${allTasks.length} 个定时任务的回执接收人: <code>${target}</code>\n以后新建的定时任务自动带上这个回执，不用再设`,
               parseMode: "html",
             });
             return;
@@ -1600,15 +1830,8 @@ class AcronPlugin extends Plugin {
             return;
           }
           const t = db.data.tasks[idx];
-          if (t.type !== "collect") {
-            await msg.edit({
-              text: `任务 <code>${id}</code> 不是收集转发任务，只有收集任务支持回执设置`,
-              parseMode: "html",
-            });
-            return;
-          }
           if (!target) {
-            const cur = (t as CollectTask).receiptTo;
+            const cur = (t as AcronTask).receiptTo;
             const show = cur
               ? cur === "off"
                 ? "已关闭"
@@ -1752,11 +1975,14 @@ class AcronPlugin extends Plugin {
           const nextSeq = currentSeq + 1;
           db.data.seq = String(nextSeq);
           const id = String(nextSeq);
+          // 默认回执：setreceipt all 设过一次后，新建任务自动带上，不用再设；
+          // 还没设过时，兜底用已有任务里最近一个设过的回执。
+          const defaultReceiptTo = getDefaultReceiptTo(db);
 
           if (sub === "send") {
             // 必须回复一条消息
             if (!msg.isReply) {
-              await msg.edit({ text: "请回复一条要定时发送的消息" });
+              await msg.edit({ text: "建任务失败：.acron send 必须回复到要定时发送的那条消息上再发一次（备注只是名字，内容就是你回复的那条消息，不要回复到这条提示上发命令）" });
               return;
             }
             const replied = await safeGetReplyMessage(msg);
@@ -1789,6 +2015,7 @@ class AcronPlugin extends Plugin {
               message: text,
               entities,
               createdAt: String(Date.now()),
+              receiptTo: defaultReceiptTo,
               remark: remark || undefined,
               replyTo: replyTo || undefined,
               display: display || undefined,
@@ -1832,6 +2059,7 @@ class AcronPlugin extends Plugin {
               message,
               replyTo: replyTo || undefined,
               createdAt: String(Date.now()),
+              receiptTo: defaultReceiptTo,
               remark: remark || undefined,
               display: display || undefined,
             };
@@ -1857,7 +2085,7 @@ class AcronPlugin extends Plugin {
           } else if (sub === "copy" || sub === "forward") {
             // 必须回复一条消息（作为源）
             if (!msg.isReply) {
-              await msg.edit({ text: "请回复一条要复制/转发的源消息" });
+              await msg.edit({ text: "建任务失败：请回复到要复制/转发的源消息上再发一次命令（不要回复到这条提示上发命令）" });
               return;
             }
             const replied = await safeGetReplyMessage(msg);
@@ -1885,6 +2113,7 @@ class AcronPlugin extends Plugin {
                 fromMsgId: String(Math.trunc(fromMsgId)),
                 replyTo: replyTo || undefined,
                 createdAt: String(Date.now()),
+                receiptTo: defaultReceiptTo,
                 remark: remark || undefined,
                 display: display || undefined,
               };
@@ -1917,6 +2146,7 @@ class AcronPlugin extends Plugin {
                 fromMsgId: String(Math.trunc(fromMsgId)),
                 replyTo: replyTo || undefined,
                 createdAt: String(Date.now()),
+                receiptTo: defaultReceiptTo,
                 remark: remark || undefined,
                 display: display || undefined,
               };
@@ -2021,6 +2251,7 @@ class AcronPlugin extends Plugin {
               sender: senderArg,
               maxCount: countNum !== undefined ? countNum : 0,
               createdAt: String(Date.now()),
+              receiptTo: defaultReceiptTo,
               remark: remark || undefined,
               display: display || undefined,
             };
@@ -2066,6 +2297,7 @@ class AcronPlugin extends Plugin {
               chatId: hasChatId as any,
               msgId: msgIdStr,
               createdAt: String(Date.now()),
+              receiptTo: defaultReceiptTo,
               remark: remark || undefined,
               display: display || undefined,
             };
@@ -2118,6 +2350,7 @@ class AcronPlugin extends Plugin {
               notify,
               pmOneSide,
               createdAt: String(Date.now()),
+              receiptTo: defaultReceiptTo,
               remark: remark || undefined,
               display: display || undefined,
             };
@@ -2159,6 +2392,7 @@ class AcronPlugin extends Plugin {
               chatId: hasChatId as any,
               msgId: msgIdStr,
               createdAt: String(Date.now()),
+              receiptTo: defaultReceiptTo,
               remark: remark || undefined,
               display: display || undefined,
             };
@@ -2216,6 +2450,7 @@ class AcronPlugin extends Plugin {
               limit: String(Math.trunc(limit)),
               regex: regexRaw,
               createdAt: String(Date.now()),
+              receiptTo: defaultReceiptTo,
               remark: remark || undefined,
               display: display || undefined,
             };
