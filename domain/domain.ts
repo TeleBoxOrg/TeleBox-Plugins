@@ -320,21 +320,36 @@ bootstrapDailyCheck();
 // ---------------------------------------------------------------------------
 const help_text = `域名到期提醒：到了可续时间，每天 12:30 发一条回执。
 
-▎加域名
-• <code>${mainPrefix}domain add xxx.pp.ua https://nic.pp.ua 2027-09-30 120</code>
+▎加 / 看
+<pre>
+添加：${mainPrefix}domain add xxx.pp.ua https://nic.pp.ua 2027-09-30 120
+查看：${mainPrefix}domain ls
+</pre>
 域名 / 官网 / 到期日 / 提前天数，官网和 120 不写也行。
 日期：2027-09-30、2027/9/30、19/12/2027 都行。
 
-▎看 / 改 / 删
-• <code>${mainPrefix}domain ls</code>
-• <code>${mainPrefix}domain edit 2 expiry 2027-09-30</code> 改到期日
-• <code>${mainPrefix}domain edit 2 early 90</code> 改提前天数
-• <code>${mainPrefix}domain edit 2 official https://xxx.com</code> 改官网
-• <code>${mainPrefix}domain rm 2</code>
+▎改
+<pre>
+到期：${mainPrefix}domain edit 2 expiry 2027-09-30
+提前：${mainPrefix}domain edit 2 early 90
+官网：${mainPrefix}domain edit 2 official https://xxx.com
+多个：${mainPrefix}domain edit 2 3 expiry 2027-09-30
+注册：${mainPrefix}domain edit 2 date 2026-09-30
+</pre>
+字段前面全是目标，多个编号/域名混着写也行。
 
-▎回执（设一次就行，没设不发）
-• <code>${mainPrefix}domain setreceipt 123456789</code>
-• <code>${mainPrefix}domain setreceipt off</code> 关掉`;
+▎删
+<pre>
+删除：${mainPrefix}domain rm 2 3
+全删：${mainPrefix}domain rm all
+</pre>
+
+▎回执
+<pre>
+设置：${mainPrefix}domain setreceipt 8404276696
+关闭：${mainPrefix}domain setreceipt off
+</pre>
+设一次就行，没设不发。`;
 
 class DomainPlugin extends Plugin {
   description: string = `域名到期提醒：只记续期的，到了可续时间每天 12:30 发一条回执\n\n${help_text}`;
@@ -472,31 +487,63 @@ class DomainPlugin extends Plugin {
           return;
         }
 
-        // ---- 删域名（ID 或域名都能删，删完自动补位）----
+        // ---- 删域名（ID 或域名都能删，可一次删多个，删完自动补位）----
+        // 关键：先按删除前的原编号把所有目标都解析出来，再一次过滤掉，
+        // 不能一个一个按 ID 删 —— 删掉 1 号后，原来的 2 号就变成 1 号了，
+        // 再按旧号删会删错。域名去重：同一个域名写两次、或 ID 和域名指同一个，只删一次。
         if (sub === "rm" || sub === "remove" || sub === "del") {
-          const target = args[1];
-          if (!target) {
+          const targets = args.slice(1).map((a) => (a || "").trim()).filter(Boolean);
+          if (targets.length === 0) {
             await reply(
-              `用法：<code>${mainPrefix}domain rm &lt;编号或域名&gt;</code>\n例如：<code>${mainPrefix}domain rm 2</code> 或 <code>${mainPrefix}domain rm xxx.pp.ua</code>`,
+              `用法：<code>${mainPrefix}domain rm &lt;编号或域名&gt; [编号或域名...]</code>\n例如：<code>${mainPrefix}domain rm 2 3</code> 或 <code>${mainPrefix}domain rm djcf.pp.ua</code> 或 <code>${mainPrefix}domain rm all</code> 全删`,
             );
             return;
           }
           const db = await getDB();
           if (normalizeDomains(db.data)) await db.write();
-          const idx = findDomainIndex(db.data, target);
-          if (idx < 0) {
-            await reply(`没找到：<code>${escapeHtml(target)}</code>，先发 <code>${mainPrefix}domain ls</code> 看编号`);
+          // 全删：rm all
+          if (targets.length === 1 && targets[0].toLowerCase() === "all") {
+            if (db.data.domains.length === 0) {
+              await reply(`列表已经是空的，没什么可删`);
+              return;
+            }
+            const removedAll = [...db.data.domains].sort((a, b) => (a.id || 0) - (b.id || 0));
+            db.data.domains = [];
+            await db.write();
+            await reply(
+              `已删除全部 ${removedAll.length} 个：${removedAll.map((d) => `<code>${d.id}</code> ${escapeHtml(d.domain)}`).join("、")}\n列表已空`,
+            );
             return;
           }
-          const removed = db.data.domains[idx];
-          db.data.domains.splice(idx, 1);
+          const removed: DomainRecord[] = [];
+          const removedDomains = new Set<string>();
+          const missing: string[] = [];
+          for (const target of targets) {
+            const idx = findDomainIndex(db.data, target);
+            if (idx < 0) {
+              missing.push(target);
+              continue;
+            }
+            const rec = db.data.domains[idx];
+            if (removedDomains.has(rec.domain)) continue;
+            removedDomains.add(rec.domain);
+            removed.push(rec);
+          }
+          if (removed.length === 0) {
+            await reply(`没找到：${missing.map((t) => `<code>${escapeHtml(t)}</code>`).join("、")}，先发 <code>${mainPrefix}domain ls</code> 看编号`);
+            return;
+          }
+          db.data.domains = db.data.domains.filter((d) => !removedDomains.has(d.domain));
           renumberDomains(db.data);
           await db.write();
           const rest = db.data.domains.length
             ? db.data.domains.map((d) => `<code>${d.id}</code> ${escapeHtml(d.domain)}`).join("、")
             : "列表已空";
+          const missingNote = missing.length
+            ? `\n没找到（已跳过）：${missing.map((t) => `<code>${escapeHtml(t)}</code>`).join("、")}`
+            : "";
           await reply(
-            `已删除：<code>${removed.id}</code> • <code>${escapeHtml(removed.domain)}</code>\n剩下已自动补位：${rest}`,
+            `已删除：${removed.map((d) => `<code>${d.id}</code> • <code>${escapeHtml(d.domain)}</code>`).join("、")}${missingNote}\n剩下已自动补位：${rest}`,
           );
           return;
         }
@@ -529,75 +576,120 @@ class DomainPlugin extends Plugin {
           return;
         }
 
-        // ---- 改域名（ID 或域名都能改，改完立刻生效）----
+        // ---- 改域名（ID 或域名都能改，可一次改多个，改完立刻生效）----
+        // 写法：edit <目标...> <字段> <新值>，字段前面的全是目标，字段后面的全是新值。
+        // 例如 edit 2 3 expiry 2027-09-30：目标是 2、3，字段是 expiry，新值是日期。
+        // 先把新值校验一次（日期 / 天数 / 官网），不对就一个都不改；对了再批量改。
         if (sub === "edit") {
-          const target = args[1];
-          const field = (args[2] || "").toLowerCase();
-          const value = args.slice(3).join(" ").trim();
+          const rest = args.slice(1).map((a) => (a || "").trim()).filter(Boolean);
           const db = await getDB();
-          if (!target) {
+          if (rest.length === 0) {
             await reply(
-              `用法：<code>${mainPrefix}domain edit &lt;编号或域名&gt; &lt;字段&gt; &lt;新值&gt;</code>\n字段：date / expiry / early / official\n例如：<code>${mainPrefix}domain edit 2 expiry 2027-09-30</code>、<code>${mainPrefix}domain edit 2 early 90</code>、<code>${mainPrefix}domain edit 2 official https://nic.pp.ua</code>`,
+              `用法：<code>${mainPrefix}domain edit &lt;编号或域名&gt; [编号或域名...] &lt;字段&gt; &lt;新值&gt;</code>\n字段：date / expiry / early / official\n例如：<code>${mainPrefix}domain edit 2 expiry 2027-09-30</code>、<code>${mainPrefix}domain edit 2 3 early 90</code>、<code>${mainPrefix}domain edit 2 official https://nic.pp.ua</code>`,
             );
             return;
           }
           if (normalizeDomains(db.data)) await db.write();
-          const idx = findDomainIndex(db.data, target);
-          if (idx < 0) {
-            await reply(`没找到：<code>${escapeHtml(target)}</code>，先发 <code>${mainPrefix}domain ls</code> 看编号`);
-            return;
-          }
-          const rec = db.data.domains[idx];
-          if (!field) {
-            await reply(domainLine(rec, todayStr()));
-            return;
-          }
-          if (field === "early") {
-            const n = Number(value);
-            if (!/^\d+$/.test(value) || n < 1 || n > 365) {
-              await reply(`❌ 提前天数要是 1~365 的数字，例如：<code>${mainPrefix}domain edit 2 early 90</code>`);
+          const FIELD_NAMES = ["date", "expiry", "exp", "early", "official"];
+          const fieldIdx = rest.findIndex((t) => FIELD_NAMES.includes(t.toLowerCase()));
+          // 没写字段：只写了一个目标时是老用法，只看那条记录。
+          if (fieldIdx < 0) {
+            if (rest.length === 1) {
+              const idx = findDomainIndex(db.data, rest[0]);
+              if (idx < 0) {
+                await reply(`没找到：<code>${escapeHtml(rest[0])}</code>，先发 <code>${mainPrefix}domain ls</code> 看编号`);
+                return;
+              }
+              await reply(domainLine(db.data.domains[idx], todayStr()));
               return;
             }
-            rec.early = n;
-            rec.notified = [];
-            await db.write();
-            await reply(`已修改：\n${domainLine(rec, todayStr())}`);
-            return;
-          }
-          if (field === "official") {
-            if (!/^https?:\/\//i.test(value)) {
-              await reply(`❌ 官网要以 https:// 开头，例如：<code>${mainPrefix}domain edit 2 official https://nic.pp.ua</code>`);
-              return;
-            }
-            rec.official = cleanOfficial(value);
-            await db.write();
-            await reply(`已修改：\n${domainLine(rec, todayStr())}`);
-            return;
-          }
-          if (field !== "date" && field !== "expiry") {
-            await reply(`❌ 只能改 date（注册日）、expiry（到期日）、early（提前天数）或 official（官网），例如：<code>${mainPrefix}domain edit 2 expiry 2027-09-30</code>`);
-            return;
-          }
-          const parsed = parseDateStrict(value);
-          if (!parsed) {
             await reply(
-              `❌ 日期格式不对，要 ${escapeHtml(DATE_FORMAT_HINT)}，你输的是：${escapeHtml(value)}`,
+              `❌ 没认出字段，要写 date（注册日）、expiry（到期日）、early（提前天数）或 official（官网），例如：<code>${mainPrefix}domain edit 2 3 expiry 2027-09-30</code>`,
             );
             return;
           }
-          const iso = toISO(parsed.y, parsed.m, parsed.d);
-          if (field === "date") {
-            // 改注册日：到期日跟着重算（注册日 + 365 天）
-            rec.registered = iso;
-            if (rec.expiry !== "永久") rec.expiry = addDaysISO(iso, VALIDITY_DAYS);
-          } else {
-            // 改到期日：注册日自动往前推（到期日 - 365 天），永久的旧记录改回要到期
-            rec.expiry = iso;
-            rec.registered = addDaysISO(iso, -VALIDITY_DAYS);
+          if (fieldIdx === 0) {
+            await reply(
+              `用法：<code>${mainPrefix}domain edit &lt;编号或域名&gt; [编号或域名...] &lt;字段&gt; &lt;新值&gt;</code>\n例如：<code>${mainPrefix}domain edit 2 3 expiry 2027-09-30</code>`,
+            );
+            return;
           }
-          rec.notified = [];
+          const targets = rest.slice(0, fieldIdx);
+          let field = rest[fieldIdx].toLowerCase();
+          if (field === "exp") field = "expiry";
+          const value = rest.slice(fieldIdx + 1).join(" ").trim();
+          if (!value) {
+            await reply(`❌ 没给新值，例如：<code>${mainPrefix}domain edit 2 3 early 90</code>`);
+            return;
+          }
+          // 先校验一次新值，不对就一个都不改。
+          let earlyNum = 0;
+          let dateISO = "";
+          if (field === "early") {
+            earlyNum = Number(value);
+            if (!/^\d+$/.test(value) || earlyNum < 1 || earlyNum > 365) {
+              await reply(`❌ 提前天数要是 1~365 的数字，例如：<code>${mainPrefix}domain edit 2 3 early 90</code>`);
+              return;
+            }
+          } else if (field === "official") {
+            if (!/^https?:\/\//i.test(value)) {
+              await reply(`❌ 官网要以 https:// 开头，例如：<code>${mainPrefix}domain edit 2 3 official https://nic.pp.ua</code>`);
+              return;
+            }
+          } else {
+            const parsed = parseDateStrict(value);
+            if (!parsed) {
+              await reply(
+                `❌ 日期格式不对，要 ${escapeHtml(DATE_FORMAT_HINT)}，你输的是：${escapeHtml(value)}`,
+              );
+              return;
+            }
+            dateISO = toISO(parsed.y, parsed.m, parsed.d);
+          }
+          const recs: DomainRecord[] = [];
+          const seenDomains = new Set<string>();
+          const missing: string[] = [];
+          for (const target of targets) {
+            const idx = findDomainIndex(db.data, target);
+            if (idx < 0) {
+              missing.push(target);
+              continue;
+            }
+            const rec = db.data.domains[idx];
+            if (seenDomains.has(rec.domain)) continue;
+            seenDomains.add(rec.domain);
+            recs.push(rec);
+          }
+          if (recs.length === 0) {
+            await reply(`没找到：${missing.map((t) => `<code>${escapeHtml(t)}</code>`).join("、")}，先发 <code>${mainPrefix}domain ls</code> 看编号`);
+            return;
+          }
+          for (const rec of recs) {
+            if (field === "early") {
+              rec.early = earlyNum;
+              rec.notified = [];
+            } else if (field === "official") {
+              rec.official = cleanOfficial(value);
+            } else if (field === "date") {
+              // 改注册日：到期日跟着重算（注册日 + 365 天）
+              rec.registered = dateISO;
+              if (rec.expiry !== "永久") rec.expiry = addDaysISO(dateISO, VALIDITY_DAYS);
+              rec.notified = [];
+            } else {
+              // 改到期日：注册日自动往前推（到期日 - 365 天），永久的旧记录改回要到期
+              rec.expiry = dateISO;
+              rec.registered = addDaysISO(dateISO, -VALIDITY_DAYS);
+              rec.notified = [];
+            }
+          }
           await db.write();
-          await reply(`已修改：\n${domainLine(rec, todayStr())}`);
+          const today = todayStr();
+          const missingNote = missing.length
+            ? `\n没找到（已跳过）：${missing.map((t) => `<code>${escapeHtml(t)}</code>`).join("、")}`
+            : "";
+          await reply(
+            `已修改 ${recs.length} 个：${missingNote}\n${recs.map((r) => domainLine(r, today)).join("\n")}`,
+          );
           return;
         }
 
