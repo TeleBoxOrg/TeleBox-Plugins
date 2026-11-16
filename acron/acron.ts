@@ -977,130 +977,58 @@ bootstrapTasks();
 
 const help_text = `⚠️ 定制版（非官方）：已覆盖远程官方插件，若需恢复官方，请 ${mainPrefix}tpm i acron
 
-▎定时复制
+显示时间 = cron 小时 + 7，以 ${mainPrefix}acron ls all 的下次时间为准。
 
-每天2点复制发送到指定对话(可指定话题或回复消息)
+▎定时发送 / 复制 / 转发 / 命令
 
-• 使用 <code>${mainPrefix}acron copy 0 0 2 * * * 对话ID/@name [备注]</code> 回复一条消息
-• 使用 <code>${mainPrefix}acron copy 0 0 2 * * * 对话ID/@name|发送时的话题ID或回复消息的ID [备注]</code> 回复一条消息
+• 发送：回复一条消息发 <code>${mainPrefix}acron send 0 0 2 * * * 对话ID/@name [备注]</code>（只存文字，不支持多媒体；每天 09:00 发）
+• 复制：回复一条消息发 <code>${mainPrefix}acron copy 0 0 2 * * * 对话ID/@name [备注]</code>
+• 转发：回复一条消息发 <code>${mainPrefix}acron forward 0 0 2 * * * 对话ID/@name [备注]</code>
+• 命令：<code>${mainPrefix}acron cmd 0 0 2 * * * 对话ID/@name [备注]</code>，下一行写要执行的命令，如 <code>${mainPrefix}a foo bar</code>
+• 目标后面加 <code>|话题ID</code> 或 <code>|回复消息ID</code> 可指定话题/回复，如 <code>对话ID|123</code>
 
-▎定时转发
+▎定时删除 / 置顶
 
-每天2点转发到指定对话(可指定话题)
-
-• 使用 <code>${mainPrefix}acron forward 0 0 2 * * * 对话ID/@name [备注]</code> 回复一条消息
-• 使用 <code>${mainPrefix}acron forward 0 0 2 * * * 对话ID/@name|发送时的话题ID [备注]</code> 回复一条消息
+<pre>删除：    ${mainPrefix}acron del 0 0 2 * * * 对话ID/@name 消息ID [备注]
+正则删除：${mainPrefix}acron del_re 0 0 2 * * * 对话ID/@name 100 /^test/i [备注]
+置顶：    ${mainPrefix}acron pin 0 0 2 * * * 对话ID/@name 消息ID 是否发通知 是否仅对自己置顶 [备注]
+取消置顶：${mainPrefix}acron unpin 0 0 2 * * * 对话ID/@name 消息ID [备注]</pre>
 
 ▎定时收集转发
 
 到点从来源群最近 100 条里，挑指定发送人的消息按时间顺序转到目标群。
-
-• 用法：<code>${mainPrefix}acron collect <6段cron> <目标> <来源> <发送人> [条数] [备注]</code>
-• 使用 <code>${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点</code>（不限条数，显示 08:00）
-• 使用 <code>${mainPrefix}acron collect 0 30 5 * * * -1002443712513 -1003219886860 @kaige325 4 kaige收集12点半</code>（每轮最多 4 条，显示 12:30）
-• 使用 <code>${mainPrefix}acron collect 0 0 5 * * * -1002443712513 -1003219886860 * 2 任意用户收集12点</code>（任意真人用户，12:00 那轮转最新 2 条）
-• 时间：显示时间 = cron 小时 + 7，以 <code>${mainPrefix}acron ls all</code> 的下次时间为准。
+<pre>用法：  ${mainPrefix}acron collect &lt;6段cron&gt; &lt;目标&gt; &lt;来源&gt; &lt;发送人&gt; [条数] [备注]
+例：    ${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点（显示 08:00，不限条数）</pre>
 • 发送人：用户名或数字 ID，最多 5 个，英文逗号连、不要空格，如 @DNSHEbot,@kaige325；不写或写 * 就是任意真人用户，机器人除外。备注是纯英文单词时容易被误当发送人，不指定发送人时先写 * 或条数。
-• 条数：发送人后跟数字就是每轮条数，不写不限，条数是所有发送人加起来的总数。指定发送人时不够数会往回找最近 24 小时内的旧消息补足（会重复）；任意用户模式只转新消息，不回补，没新消息就跳过。没消息也照样发回执。
+• 条数：发送人后跟数字就是每轮条数，不写不限，是所有发送人加起来的总数。
+• 指定发送人不够数时，往回找最近 24 小时内的旧消息补足（会重复）；任意用户模式只转新消息，不回补，没新消息就跳过。没消息也照样发回执。
 • 首轮没有已处理记录时，转最近历史里的消息。
-• 回执：见下一节。
-
 
 ▎回执（设一次，新任务自动带）
 
-所有定时任务通用，不只收集转发。发送/命令/复制/转发/删除/置顶/收集，跑完（成功或失败）都发一条回执到指定 ID，不发到目标群和来源群；没设就不发，只在 <code>${mainPrefix}acron ls all</code> 里看结果。回执发送失败不影响任务本身。
+所有任务通用，跑完（成功或失败）都发一条到指定 ID，不发到目标群和来源群；没设就不发，只在 <code>${mainPrefix}acron ls all</code> 里看结果。回执发送失败不影响任务本身。
+<pre>设一次：  ${mainPrefix}acron setreceipt all 123456789（现有全改，同时存为默认）
+只改一个：${mainPrefix}acron setreceipt 9 123456789；关掉一个：${mainPrefix}acron setreceipt 9 off；只看：${mainPrefix}acron setreceipt 9</pre>
+• 换默认：再发一次 all，已建好的不会自动变。还没存过默认时，新任务用已有任务里最近一个设过的回执。
 
-第 1 步，设一次默认回执（123456789 换成你要收回执的数字 ID）：
-• <code>${mainPrefix}acron setreceipt all 123456789</code>
-这条会把现有任务全改掉，同时把这个接收人存为默认。
-
-第 2 步，以后新建任务不用再设，建完自动带上，例如：
-• <code>${mainPrefix}acron send 0 0 2 * * * 对话ID/@name 备注</code>（回复一条消息）
-• <code>${mainPrefix}acron collect 0 0 5 * * * -1002443712513 -1003219886860 * 1 备注</code>
-
-第 3 步，核对：
-• <code>${mainPrefix}acron ls all</code>，新任务下面直接显示 <code>回执: 123456789</code>
-
-• 想换默认：再发一次 <code>${mainPrefix}acron setreceipt all 新ID</code>，以后新建的跟新的走，已建好的不会自动变，改它们再发一次 all。
-• 只改某一个：<code>${mainPrefix}acron setreceipt 9 123456789</code>，只改 9 号，不动默认。
-• 关掉某一个：<code>${mainPrefix}acron setreceipt 9 off</code>
-• 只看不改：<code>${mainPrefix}acron setreceipt 9</code> 或 <code>${mainPrefix}acron setreceipt all</code>
-• 还没存过默认时，新建任务会兜底用已有任务里最近一个设过的回执。
-
-▎定时发送
-
-稍微麻烦了一点, 但是可以保证消息的完整格式. 储存此消息到数据库, 每天2点在指定对话发送(可指定话题或回复消息). 不支持带多媒体或 replyMarkup 的消息, 可考虑使用本插件的定时复制/转发功能
-
-• 使用 <code>${mainPrefix}acron send 0 0 2 * * * 对话ID/@name [备注]</code> 回复一条消息
-• 使用 <code>${mainPrefix}acron send 0 0 2 * * * 对话ID/@name|发送时话题的ID或回复消息的ID [备注]</code> 回复一条消息
-
-▎定时删除
-
-每天2点删除指定ID或@name的对话中的指定ID的消息
-
-• <code>${mainPrefix}acron del 0 0 2 * * * 对话ID/@name 消息ID [备注]</code>
-
-▎定时正则删除
-
-每天2点删除指定ID或@name的对话中的最近的 100 条消息中 内容符合正则表达式的消息
-
-• <code>${mainPrefix}acron del_re 0 0 2 * * * 对话ID/@name 100 /^test/i [备注]</code>
-
-▎定时置顶/取消置顶
-
-每天2点在指定ID或@name的对话中置顶指定ID的消息, 是否发通知(true/1, false/0), 是否仅对自己置顶(true/1, false/0)
-
-• <code>${mainPrefix}acron pin 0 0 2 * * * 对话ID/@name 消息ID 是否发通知 是否仅对自己置顶 [备注]</code>
-
-每天2点在指定ID或@name的对话中取消置顶指定ID的消息
-
-• <code>${mainPrefix}acron unpin 0 0 2 * * * 对话ID/@name 消息ID [备注]</code>
-
-▎定时执行命令
-
-每天2点在指定ID或@name的对话中执行命令 <code>${mainPrefix}a foo bar</code>(可指定话题或回复消息)
-注意要换行写
-
-<pre>${mainPrefix}acron cmd 0 0 2 * * * 对话ID/@name [备注]
-${mainPrefix}a foo bar</pre>
-
-<pre>${mainPrefix}acron cmd 0 0 2 * * * 对话ID/@name|发送时话题的ID或回复消息的ID [备注]
-${mainPrefix}a foo bar</pre>
-
-典型的使用场景:
-
-每天2点自动备份(调用 <code>${mainPrefix}bf</code> 命令)
-
-<pre>${mainPrefix}acron cmd 0 0 2 * * * me 定时备份
-${mainPrefix}bf</pre>
-
-每天2点自动更新 <code>eat</code> 的表情包配置(调用 <code>${mainPrefix}eat set</code> 命令)
-
-<pre>${mainPrefix}acron cmd 0 0 2 * * * me 定时更新表情包
-${mainPrefix}eat set</pre>
-
-• <code>${mainPrefix}acron list</code>, <code>${mainPrefix}acron ls</code> - 列出当前会话中的所有定时任务
-• <code>${mainPrefix}acron ls all</code>, <code>${mainPrefix}acron la</code> - 列出所有的定时任务
-• <code>${mainPrefix}acron ls del</code> - 列出当前会话中的类型为 del 的定时任务
-• <code>${mainPrefix}acron ls all del</code>, <code>${mainPrefix}acron la del</code> - 列出所有的类型为 del 的定时任务
-• <code>${mainPrefix}acron rm 定时任务ID</code> - 删除指定的定时任务，一次删多个请用空格分隔，例如 <code>${mainPrefix}acron rm 7 8 9 10 11</code>，只删其中一个就只写一个 ID，例如 <code>${mainPrefix}acron rm 7</code>
 ▎直接改任务（edit，不用删了重建）
 
-一次只改一个字段，一条一条发。只发 <code>${mainPrefix}acron edit 任务号</code> 就是只看当前字段，不改。
-
-• 改时间：<code>${mainPrefix}acron edit 16 time 0 0 13 * * *</code>（改成 20:00，显示时间 = cron 小时 + 7）
-• 改目标：<code>${mainPrefix}acron edit 16 target -1002443712513</code>
-• 改备注：<code>${mainPrefix}acron edit 16 remark 新备注</code>，写 - 就是清空：<code>${mainPrefix}acron edit 16 remark -</code>
-• 收集任务改来源：<code>${mainPrefix}acron edit 16 source -1003219886860</code>（改来源会清空已处理 ID）
-• 收集任务改发送人：<code>${mainPrefix}acron edit 16 sender *</code>（* = 任意真人用户，最多 5 个，英文逗号连）
-• 收集任务改条数：<code>${mainPrefix}acron edit 16 count 1</code>（0 = 不限）
-• 只看：<code>${mainPrefix}acron edit 16</code>
+一次改一个字段，可以同时改一个或多个任务，一条一条发。只发 <code>${mainPrefix}acron edit 任务号</code> 就是只看当前字段，不改。
+<pre>改时间：  ${mainPrefix}acron edit 16 time 0 0 13 * * *（改成 20:00，显示时间 = cron 小时 + 7）
+改目标：  ${mainPrefix}acron edit 16 target -1002443712513
+改多个：  ${mainPrefix}acron edit 39 40 target -1002443712513（一次改两个任务）
+改备注：  ${mainPrefix}acron edit 16 remark 新备注（写 - 清空）
+改来源：  ${mainPrefix}acron edit 16 source -1003219886860（收集任务；改来源会清空已处理 ID）
+改发送人：${mainPrefix}acron edit 16 sender *（收集任务；* = 任意真人用户，最多 5 个，英文逗号连）
+改条数：  ${mainPrefix}acron edit 16 count 1（收集任务；0 = 不限）
+只看：    ${mainPrefix}acron edit 16</pre>
 
 改完保留任务号、历史、回执和已处理 ID（改来源除外）。消息内容和源消息不能用 edit 改，仍需删了重建。改完用 <code>${mainPrefix}acron ls all</code> 核对。
 
-• <code>${mainPrefix}acron edit 定时任务ID 字段 新值</code> - 见上面“直接改任务”一节。
-• <code>${mainPrefix}acron disable/off 定时任务ID</code> - 禁用指定的定时任务
-• <code>${mainPrefix}acron enable/on 定时任务ID</code> - 启用指定的定时任务
+• <code>${mainPrefix}acron list</code> / <code>${mainPrefix}acron ls</code> - 列出当前会话的任务；<code>${mainPrefix}acron ls all</code> / <code>${mainPrefix}acron la</code> - 列出全部任务，一页最多 10 个，<code>${mainPrefix}acron ls all 2</code> 看第 2 页
+• <code>${mainPrefix}acron rm 任务ID [任务ID...]</code> - 删除任务，如 <code>${mainPrefix}acron rm 7 8 9</code>；删完自动往前补号，不留空号（后面的任务号会变，删之前先看 <code>${mainPrefix}acron ls all</code> 核对）
+• <code>${mainPrefix}acron disable/off 任务ID [任务ID...]</code> - 禁用一个或多个任务
+• <code>${mainPrefix}acron enable/on 任务ID [任务ID...]</code> - 启用一个或多个任务
 `;
 
 class AcronPlugin extends Plugin {
@@ -1128,16 +1056,15 @@ class AcronPlugin extends Plugin {
         }
 
         if (sub === "list" || sub === "ls" || sub === "la") {
-          let p1 = (args[1] || "").toLowerCase();
-          let p2 = (args[2] || "").toLowerCase();
-          if (sub === "la") {
-            p2 = p1;
-            p1 = "all";
-          }
-
-          const scopeAll = p1 === "all";
-          const maybeType = (scopeAll ? p2 : p1) as AcronType | "";
-          const typeFilter: AcronType | undefined = [
+          // la 等同于 ls all；参数里找范围（all）、类型、页码，顺序不限。
+          // 一页最多 10 个：.acron ls all 2 看第 2 页，.acron ls all send 2 看发送任务的第 2 页。
+          const PAGE_SIZE = 10;
+          const rawTokens = args
+            .slice(1)
+            .map((a: string) => String(a).toLowerCase());
+          const tokens = sub === "la" ? ["all", ...rawTokens] : rawTokens;
+          const scopeAll = tokens.includes("all");
+          const typeNames = [
             "send",
             "cmd",
             "copy",
@@ -1147,9 +1074,12 @@ class AcronPlugin extends Plugin {
             "pin",
             "unpin",
             "collect",
-          ].includes(maybeType as any)
-            ? (maybeType as AcronType)
-            : undefined;
+          ];
+          const typeFilter: AcronType | undefined = tokens.find((t) =>
+            typeNames.includes(t),
+          ) as AcronType | undefined;
+          const pageToken = tokens.find((t) => /^\d+$/.test(t));
+          const wantPage = Math.max(1, Number(pageToken) || 1);
 
           const typeLabel = (tp?: AcronType) =>
             tp === "send"
@@ -1210,13 +1140,21 @@ class AcronPlugin extends Plugin {
           lines.push(header);
           lines.push("");
 
+          // 分页：一页最多 10 个，页码超出范围就取最后一页
+          const total = tasks.length;
+          const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+          const pageNum = Math.min(wantPage, totalPages);
+          const pageTasks = tasks.slice(
+            (pageNum - 1) * PAGE_SIZE,
+            pageNum * PAGE_SIZE,
+          );
+
           // 分块显示：先启用，再禁用；如果对应块为空则不显示表头
-          const enabledTasks = tasks.filter((t) => !t.disabled);
-          const disabledTasks = tasks.filter((t) => t.disabled);
+          const enabledTasks = pageTasks.filter((t) => !t.disabled);
+          const disabledTasks = pageTasks.filter((t) => t.disabled);
 
           if (enabledTasks.length > 0) {
             lines.push("🔛 已启用:");
-            lines.push("");
             for (const t of enabledTasks) {
               const nextDt = cron.sendAt(t.cron);
               const entityInfo = await formatEntity(
@@ -1319,13 +1257,11 @@ class AcronPlugin extends Plugin {
               if (t.lastResult) lines.push(`结果: ${t.lastResult}`);
               if (t.lastError) lines.push(`错误: ${t.lastError}`);
               lines.push(`复制: ${buildCopyCommand(t)}`);
-              lines.push("");
             }
           }
 
           if (disabledTasks.length > 0) {
             lines.push("⏹ 已禁用:");
-            lines.push("");
             for (const t of disabledTasks) {
               const entityInfo = await formatEntity(
                 (t as any).chatId ?? t.chat,
@@ -1371,8 +1307,20 @@ class AcronPlugin extends Plugin {
               if (t.lastResult) lines.push(`结果: ${t.lastResult}`);
               if (t.lastError) lines.push(`错误: ${t.lastError}`);
               lines.push(`复制: ${buildCopyCommand(t)}`);
-              lines.push("");
             }
+          }
+
+          // 页脚：多页时显示页码和下一页命令
+          if (totalPages > 1) {
+            const nextCmd =
+              pageNum < totalPages
+                ? `，下一页：${mainPrefix}acron ${
+                    scopeAll ? "ls all" : "ls"
+                  }${typeFilter ? ` ${typeFilter}` : ""} ${pageNum + 1}`
+                : "";
+            lines.push(
+              `第 ${pageNum}/${totalPages} 页，共 ${total} 个任务${nextCmd}`,
+            );
           }
 
           // 分片发送，避免超长
@@ -1395,50 +1343,89 @@ class AcronPlugin extends Plugin {
         }
 
         if (sub === "edit") {
-          // 直接编辑：.acron edit <ID> <字段> <新值>，不用删了重建。
-          // 改时间、目标、备注适用于所有类型；source/sender/count 只适用于收集任务。
+          // 直接编辑：.acron edit <ID> [ID...] <字段> <新值>，不用删了重建，一次改一个字段，
+          // 可以同时改一个或多个任务。改时间、目标、备注适用于所有类型；source/sender/count 只适用于收集任务。
           // 编辑保留任务 ID、创建时间、历史、回执和已处理ID（改来源除外：来源变了，旧已处理ID清空，
           // 否则新来源里 ID 更小的消息会被误当成已处理而跳过）。
           // 不能用 edit 改的：send/cmd 的消息内容、copy/forward 的源消息，仍需删了重建。
-          const id = args[1];
-          const fieldRaw = (args[2] || "").toLowerCase();
-          const usage = `用法:\n<code>${mainPrefix}acron edit 任务ID time 0 0 13 * * *</code> 改时间\n<code>${mainPrefix}acron edit 任务ID target 对话ID/@name</code> 改目标（chat 也一样）\n<code>${mainPrefix}acron edit 任务ID remark 新备注</code> 改备注，写 <code>-</code> 清空备注\n收集任务专用:\n<code>${mainPrefix}acron edit 任务ID source 来源对话ID/@name</code> 改来源（会清空已处理ID）\n<code>${mainPrefix}acron edit 任务ID sender @example_bot,@example_user</code> 改发送人（* = 任意真人用户，最多 5 个）\n<code>${mainPrefix}acron edit 任务ID count 2</code> 改每轮条数（0 = 不限）\n只写 <code>${mainPrefix}acron edit 任务ID</code> 查看当前可改的字段`;
-          if (!id) {
+          const usage = `用法:\n<code>${mainPrefix}acron edit 任务ID [任务ID...] time 0 0 13 * * *</code> 改时间\n<code>${mainPrefix}acron edit 任务ID [任务ID...] target 对话ID/@name</code> 改目标（chat 也一样）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] remark 新备注</code> 改备注，写 <code>-</code> 清空备注\n收集任务专用:\n<code>${mainPrefix}acron edit 任务ID [任务ID...] source 来源对话ID/@name</code> 改来源（会清空已处理ID）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] sender @example_bot,@example_user</code> 改发送人（* = 任意真人用户，最多 5 个）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] count 2</code> 改每轮条数（0 = 不限）\n只写 <code>${mainPrefix}acron edit 任务ID</code> 查看当前可改的字段`;
+          // 开头的纯数字 token 都是任务 ID，第一个非数字 token 是字段，之后全是新值。
+          const rest = args.slice(1);
+          const ids: string[] = [];
+          let p = 0;
+          while (p < rest.length && /^\d+$/.test(rest[p])) {
+            if (!ids.includes(rest[p])) ids.push(rest[p]);
+            p++;
+          }
+          const fieldRaw = (rest[p] || "").toLowerCase();
+          const valueTokens = rest.slice(p + 1);
+          if (ids.length === 0) {
             await msg.edit({ text: usage, parseMode: "html" });
             return;
           }
           const db = await getDB();
-          const idx = db.data.tasks.findIndex((t) => t.id === id);
-          if (idx < 0) {
+          const found = ids.map((id) => ({
+            id,
+            idx: db.data.tasks.findIndex((t) => t.id === id),
+          }));
+          const notFound = found.filter((f) => f.idx < 0).map((f) => f.id);
+          const targets = found
+            .filter((f) => f.idx >= 0)
+            .map((f) => db.data.tasks[f.idx]);
+          if (targets.length === 0) {
             await msg.edit({
-              text: `未找到任务: <code>${id}</code>`,
+              text: `未找到任务: ${notFound
+                .map((d) => `<code>${d}</code>`)
+                .join("，")}`,
               parseMode: "html",
             });
             return;
           }
-          const t = db.data.tasks[idx];
           if (!fieldRaw) {
-            const cur: string[] = [
-              `任务 <code>${id}</code> ${t.remark || ""}（${t.type}）`,
-              `当前时间: <code>${t.cron}</code>`,
-              `目标: <code>${t.chat}</code>`,
-            ];
-            if (t.type === "collect") {
-              const ct = t as CollectTask;
-              cur.push(`来源: <code>${ct.sourceChat}</code>`);
-              cur.push(`发送人: <code>${ct.sender}</code>`);
-              cur.push(
-                `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
-              );
-              if (ct.lastSeenId)
-                cur.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
+            // 只看不改：一个任务显示完整字段，多个任务每行显示一行摘要
+            if (targets.length === 1) {
+              const t = targets[0];
+              const id = t.id;
+              const cur: string[] = [
+                `任务 <code>${id}</code> ${t.remark || ""}（${t.type}）`,
+                `当前时间: <code>${t.cron}</code>`,
+                `目标: <code>${t.chat}</code>`,
+              ];
+              if (t.type === "collect") {
+                const ct = t as CollectTask;
+                cur.push(`来源: <code>${ct.sourceChat}</code>`);
+                cur.push(`发送人: <code>${ct.sender}</code>`);
+                cur.push(
+                  `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
+                );
+                if (ct.lastSeenId)
+                  cur.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
+              }
+              if (t.receiptTo)
+                cur.push(`回执: <code>${t.receiptTo}</code>`);
+              cur.push(`备注: ${t.remark || "（无）"}`);
+              cur.push("");
+              cur.push(usage);
+              await msg.edit({ text: cur.join("\n"), parseMode: "html" });
+              return;
             }
-            if (t.receiptTo)
-              cur.push(`回执: <code>${t.receiptTo}</code>`);
-            cur.push(`备注: ${t.remark || "（无）"}`);
-            cur.push("");
-            cur.push(usage);
-            await msg.edit({ text: cur.join("\n"), parseMode: "html" });
+            const lines = targets.map((t) => {
+              let line = `任务 <code>${t.id}</code> ${t.remark || ""}（${t.type}）时间 <code>${t.cron}</code> 目标 <code>${t.chat}</code>`;
+              if (t.type === "collect") {
+                const ct = t as CollectTask;
+                line += ` 来源 <code>${ct.sourceChat}</code> 发送人 <code>${ct.sender}</code> 每轮 ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`;
+              }
+              return line;
+            });
+            if (notFound.length > 0)
+              lines.push(
+                `未找到任务: ${notFound
+                  .map((d) => `<code>${d}</code>`)
+                  .join("，")}`,
+              );
+            lines.push("");
+            lines.push(usage);
+            await msg.edit({ text: lines.join("\n"), parseMode: "html" });
             return;
           }
           const field =
@@ -1466,22 +1453,15 @@ class AcronPlugin extends Plugin {
             });
             return;
           }
-          if (
-            (field === "source" || field === "sender" || field === "count") &&
-            t.type !== "collect"
-          ) {
-            await msg.edit({
-              text: `任务 <code>${id}</code> 不是收集转发任务，只有收集任务能改 ${field}`,
-              parseMode: "html",
-            });
-            return;
-          }
-          const valueTokens = args.slice(3);
+          // 字段值先校验一次，通过后再逐个任务改
+          let parsedCron: string | undefined;
+          let resolvedChat: { id: string; display?: string } | undefined;
+          let resolvedSource: { id: string; display?: string } | undefined;
           if (field === "time") {
             const parsed = parseCronFromArgs(valueTokens);
             if (!parsed || parsed.rest.length > 0) {
               await msg.edit({
-                text: `时间后面只能写 6 段 Cron，例如: <code>${mainPrefix}acron edit ${id} time 0 0 13 * * *</code>`,
+                text: `时间后面只能写 6 段 Cron，例如: <code>${mainPrefix}acron edit ${ids[0]} time 0 0 13 * * *</code>`,
                 parseMode: "html",
               });
               return;
@@ -1495,113 +1475,146 @@ class AcronPlugin extends Plugin {
               });
               return;
             }
-            const oldCron = t.cron;
-            t.cron = parsed.cron;
-            const key = makeCronKey(id);
-            cronManager.del(key);
-            await db.write();
-            if (!t.disabled) await scheduleTask(t as AcronTask);
-            const nextAt = t.disabled
-              ? null
-              : (cron as any).sendAt(t.cron);
-            await msg.edit({
-              text: [
-                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的时间`,
-                `时间: <code>${oldCron}</code> → <code>${t.cron}</code>`,
-                t.disabled
-                  ? "任务处于禁用状态，本次只改了设置，下次不执行，直到 enable"
-                  : nextAt
-                    ? `下次执行: ${formatDate(nextAt.toJSDate())}`
-                    : "",
-                `复制: ${buildCopyCommand(t as AcronTask)}`,
-              ]
-                .filter(Boolean)
-                .join("\n"),
-              parseMode: "html",
-            });
-            return;
-          }
-          if (field === "remark") {
+            parsedCron = parsed.cron;
+          } else if (field === "remark") {
             if (valueTokens.length === 0) {
               await msg.edit({
-                text: `请写新备注，例如: <code>${mainPrefix}acron edit ${id} remark 新备注</code>，写 <code>-</code> 清空备注`,
+                text: `请写新备注，例如: <code>${mainPrefix}acron edit ${ids[0]} remark 新备注</code>，写 <code>-</code> 清空备注`,
                 parseMode: "html",
               });
               return;
             }
-            const joined = valueTokens.join(" ");
-            const oldRemark = t.remark || "（无）";
-            t.remark = joined === "-" ? undefined : joined;
-            await db.write();
-            // 重新排程：否则下次运行的闭包还是旧备注，回执里显示旧名字。
-            cronManager.del(makeCronKey(id));
-            if (!t.disabled) await scheduleTask(t as AcronTask);
+          } else {
+            // chat / source / sender / count 都只接受一个值
+            if (valueTokens.length !== 1) {
+              await msg.edit({
+                text: `${field} 只能写一个值，例如: <code>${mainPrefix}acron edit ${ids[0]} ${field} 值</code>`,
+                parseMode: "html",
+              });
+              return;
+            }
+            const value = valueTokens[0];
+            if (field === "chat") {
+              resolvedChat = await formatEntity(value);
+            } else if (field === "source") {
+              resolvedSource = await formatEntity(value);
+            } else if (field === "sender") {
+              if (value !== "*" && !isPlausibleSenderToken(value)) {
+                await msg.edit({
+                  text: `发送人写法不对，例如 @example_bot,@example_user，或 *（任意真人用户）`,
+                  parseMode: "html",
+                });
+                return;
+              }
+              const senderList = parseSenderList(value);
+              if (
+                !isAnyUserSender(value) &&
+                (senderList.length === 0 || senderList.length > 5)
+              ) {
+                await msg.edit({
+                  text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再改，多个发送人之间用英文逗号连接、不要加空格，例如 @example_bot,@example_user`,
+                });
+                return;
+              }
+            } else if (field === "count") {
+              if (!/^\d+$/.test(value)) {
+                await msg.edit({
+                  text: `每轮条数必须是数字，例如 <code>${mainPrefix}acron edit ${ids[0]} count 2</code>，0 = 不限`,
+                  parseMode: "html",
+                });
+                return;
+              }
+            }
+          }
+          // 逐个任务改；收集任务专用的字段碰到非收集任务只跳过它，不影响其他
+          const fieldLabel =
+            field === "time"
+              ? "时间"
+              : field === "chat"
+                ? "目标"
+                : field === "source"
+                  ? "来源"
+                  : field === "sender"
+                    ? "发送人"
+                    : field === "count"
+                      ? "每轮条数"
+                      : "备注";
+          const changed: { t: AcronTask; oldText: string; newText: string }[] =
+            [];
+          const skipped: string[] = [];
+          let clearedLastSeen = false;
+          for (const t of targets) {
+            if (
+              (field === "source" || field === "sender" || field === "count") &&
+              t.type !== "collect"
+            ) {
+              skipped.push(`${t.id} 不是收集任务`);
+              continue;
+            }
+            if (field === "time") {
+              const oldCron = t.cron;
+              t.cron = parsedCron as string;
+              changed.push({ t, oldText: oldCron, newText: t.cron });
+            } else if (field === "remark") {
+              const joined = valueTokens.join(" ");
+              const oldRemark = t.remark || "（无）";
+              t.remark = joined === "-" ? undefined : joined;
+              changed.push({
+                t,
+                oldText: oldRemark,
+                newText: t.remark || "（无）",
+              });
+            } else if (field === "chat") {
+              const value = valueTokens[0];
+              const oldChat = t.chat;
+              t.chat = value;
+              const chatIdNum = Number(resolvedChat?.id);
+              (t as any).chatId = Number.isFinite(chatIdNum)
+                ? String(chatIdNum)
+                : undefined;
+              if (resolvedChat?.display) t.display = resolvedChat.display;
+              changed.push({ t, oldText: oldChat, newText: value });
+            } else if (field === "source") {
+              const ct = t as CollectTask;
+              const value = valueTokens[0];
+              const oldSource = ct.sourceChat;
+              ct.sourceChat = value;
+              const sourceChatIdNum = Number(resolvedSource?.id);
+              (ct as any).sourceChatId = Number.isFinite(sourceChatIdNum)
+                ? String(sourceChatIdNum)
+                : undefined;
+              if (ct.lastSeenId) clearedLastSeen = true;
+              ct.lastSeenId = undefined;
+              changed.push({ t, oldText: oldSource, newText: value });
+            } else if (field === "sender") {
+              const ct = t as CollectTask;
+              const value = valueTokens[0];
+              const oldSender = ct.sender;
+              ct.sender = value;
+              changed.push({ t, oldText: oldSender, newText: value });
+            } else {
+              // count
+              const ct = t as CollectTask;
+              const value = valueTokens[0];
+              const oldCount = ct.maxCount;
+              ct.maxCount = Number(value);
+              changed.push({
+                t,
+                oldText: oldCount > 0 ? `${oldCount} 条` : "不限",
+                newText: ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限",
+              });
+            }
+          }
+          if (changed.length === 0) {
             await msg.edit({
               text: [
-                `✅ 已修改任务 <code>${id}</code> 的备注`,
-                `备注: ${oldRemark} → ${t.remark || "（无）"}`,
-                `复制: ${buildCopyCommand(t as AcronTask)}`,
-              ].join("\n"),
-              parseMode: "html",
-            });
-            return;
-          }
-          // 其余字段都只接受一个值
-          if (valueTokens.length !== 1) {
-            await msg.edit({
-              text: `${field} 只能写一个值，例如: <code>${mainPrefix}acron edit ${id} ${field} 值</code>`,
-              parseMode: "html",
-            });
-            return;
-          }
-          const value = valueTokens[0];
-          if (field === "chat") {
-            const oldChat = t.chat;
-            const { id: resolvedChatId, display } =
-              await formatEntity(value);
-            const chatIdNum = Number(resolvedChatId);
-            t.chat = value;
-            (t as any).chatId = Number.isFinite(chatIdNum)
-              ? String(chatIdNum)
-              : undefined;
-            if (display) t.display = display;
-            await db.write();
-            // 重新排程：只写 DB 的话，下次运行的闭包还是旧目标（列表显示新值、实际跑旧值）。
-            cronManager.del(makeCronKey(id));
-            if (!t.disabled) await scheduleTask(t as AcronTask);
-            await msg.edit({
-              text: [
-                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的目标`,
-                `目标: <code>${oldChat}</code> → <code>${value}</code>`,
-                `复制: ${buildCopyCommand(t as AcronTask)}`,
-              ].join("\n"),
-              parseMode: "html",
-            });
-            return;
-          }
-          if (field === "source") {
-            const ct = t as CollectTask;
-            const oldSource = ct.sourceChat;
-            const { id: resolvedSourceChatId } = await formatEntity(value);
-            const sourceChatIdNum = Number(resolvedSourceChatId);
-            ct.sourceChat = value;
-            (ct as any).sourceChatId = Number.isFinite(sourceChatIdNum)
-              ? String(sourceChatIdNum)
-              : undefined;
-            const hadLastSeen = !!ct.lastSeenId;
-            ct.lastSeenId = undefined;
-            await db.write();
-            // 重新排程：只写 DB 的话，下次运行的闭包还是旧来源。
-            cronManager.del(makeCronKey(id));
-            if (!t.disabled) await scheduleTask(t as AcronTask);
-            await msg.edit({
-              text: [
-                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的来源`,
-                `来源: <code>${oldSource}</code> → <code>${value}</code>`,
-                hadLastSeen
-                  ? "已处理ID已清空（来源变了，旧 ID 对新来源没有意义），下轮按新来源的最近消息算"
+                `没有任务被修改`,
+                ...skipped.map((s) => `⏭️ ${s}`),
+                notFound.length > 0
+                  ? `未找到任务: ${notFound
+                      .map((d) => `<code>${d}</code>`)
+                      .join("，")}`
                   : "",
-                `复制: ${buildCopyCommand(t as AcronTask)}`,
               ]
                 .filter(Boolean)
                 .join("\n"),
@@ -1609,70 +1622,89 @@ class AcronPlugin extends Plugin {
             });
             return;
           }
-          if (field === "sender") {
-            const ct = t as CollectTask;
-            const oldSender = ct.sender;
-            if (value !== "*" && !isPlausibleSenderToken(value)) {
-              await msg.edit({
-                text: `发送人写法不对，例如 @example_bot,@example_user，或 *（任意真人用户）`,
-                parseMode: "html",
-              });
-              return;
-            }
-            const senderList = parseSenderList(value);
-            if (
-              !isAnyUserSender(value) &&
-              (senderList.length === 0 || senderList.length > 5)
-            ) {
-              await msg.edit({
-                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再改，多个发送人之间用英文逗号连接、不要加空格，例如 @example_bot,@example_user`,
-              });
-              return;
-            }
-            ct.sender = value;
-            await db.write();
-            // 重新排程：只写 DB 的话，下次运行的闭包还是旧发送人。
-            cronManager.del(makeCronKey(id));
-            if (!t.disabled) await scheduleTask(t as AcronTask);
-            await msg.edit({
-              text: [
-                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的发送人`,
-                `发送人: <code>${oldSender}</code> → <code>${value}</code>`,
-                "已处理ID保留不变，下轮仍从上次已处理的位置往后算",
-                `复制: ${buildCopyCommand(t as AcronTask)}`,
-              ].join("\n"),
-              parseMode: "html",
-            });
-            return;
+          await db.write();
+          // 重新排程：只写 DB 的话，下次运行的闭包还是旧值。
+          for (const { t } of changed) {
+            cronManager.del(makeCronKey(t.id));
+            if (!t.disabled) await scheduleTask(t);
           }
-          // count
-          {
-            const ct = t as CollectTask;
-            if (!/^\d+$/.test(value)) {
-              await msg.edit({
-                text: `每轮条数必须是数字，例如 <code>${mainPrefix}acron edit ${id} count 2</code>，0 = 不限`,
-                parseMode: "html",
-              });
-              return;
+          const lines: string[] = [];
+          if (
+            changed.length === 1 &&
+            skipped.length === 0 &&
+            notFound.length === 0
+          ) {
+            const { t, oldText, newText } = changed[0];
+            lines.push(
+              `✅ 已修改任务 <code>${t.id}</code> ${t.remark || ""} 的${fieldLabel}`,
+              `${fieldLabel}: <code>${oldText}</code> → <code>${newText}</code>`,
+            );
+            if (field === "source" && clearedLastSeen)
+              lines.push(
+                "已处理ID已清空（来源变了，旧 ID 对新来源没有意义），下轮按新来源的最近消息算",
+              );
+            if (field === "sender")
+              lines.push("已处理ID保留不变，下轮仍从上次已处理的位置往后算");
+            if (field === "time") {
+              if (t.disabled) {
+                lines.push(
+                  "任务处于禁用状态，本次只改了设置，下次不执行，直到 enable",
+                );
+              } else {
+                const nextAt = (cron as any).sendAt
+                  ? (cron as any).sendAt(t.cron)
+                  : null;
+                if (nextAt)
+                  lines.push(`下次执行: ${formatDate(nextAt.toJSDate())}`);
+              }
             }
-            const oldCount = ct.maxCount;
-            ct.maxCount = Number(value);
-            await db.write();
-            // 重新排程：只写 DB 的话，下次运行的闭包还是旧条数。
-            cronManager.del(makeCronKey(id));
-            if (!t.disabled) await scheduleTask(t as AcronTask);
-            await msg.edit({
-              text: [
-                `✅ 已修改任务 <code>${id}</code> ${t.remark || ""} 的每轮条数`,
-                `每轮条数: ${oldCount > 0 ? `${oldCount} 条` : "不限"} → ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
-                `复制: ${buildCopyCommand(t as AcronTask)}`,
-              ].join("\n"),
-              parseMode: "html",
-            });
-            return;
+            lines.push(`复制: ${buildCopyCommand(t)}`);
+          } else {
+            lines.push(
+              `✅ 已修改 ${changed.length} 个任务的${fieldLabel}`,
+              ...changed.map(
+                (c) =>
+                  `• <code>${c.t.id}</code> ${c.t.remark || ""}：<code>${c.oldText}</code> → <code>${c.newText}</code>`,
+              ),
+            );
+            if (field === "source" && clearedLastSeen)
+              lines.push(
+                "已处理ID已清空（来源变了，旧 ID 对新来源没有意义），下轮按新来源的最近消息算",
+              );
+            if (field === "sender")
+              lines.push("已处理ID保留不变，下轮仍从上次已处理的位置往后算");
+            if (field === "time") {
+              const disabledIds = changed
+                .filter((c) => c.t.disabled)
+                .map((c) => c.t.id);
+              if (disabledIds.length > 0)
+                lines.push(
+                  `任务 ${disabledIds
+                    .map((d) => `<code>${d}</code>`)
+                    .join("，")} 处于禁用状态，本次只改了设置，下次不执行，直到 enable`,
+                );
+              else {
+                const nextAt = (cron as any).sendAt
+                  ? (cron as any).sendAt(changed[0].t.cron)
+                  : null;
+                if (nextAt)
+                  lines.push(`下次执行: ${formatDate(nextAt.toJSDate())}`);
+              }
+            }
           }
+          for (const s of skipped) lines.push(`⏭️ ${s}`);
+          if (notFound.length > 0)
+            lines.push(
+              `未找到任务: ${notFound
+                .map((d) => `<code>${d}</code>`)
+                .join("，")}`,
+            );
+          await msg.edit({
+            text: lines.join("\n"),
+            parseMode: "html",
+          });
+          return;
         }
-
         if (sub === "rm") {
           // 批量删除：.acron rm 7 8 9 10 11 一次删多个，也兼容旧的单个 .acron rm 7。
           // 多个 ID 之间用空格分隔，也支持逗号分隔（如 .acron rm 7,8,9）。
@@ -1708,12 +1740,54 @@ class AcronPlugin extends Plugin {
             db.data.tasks.splice(idx, 1);
             deleted.push(`${id}${remark}`);
           }
-          if (deleted.length > 0) await db.write();
+          // 删完自动往前补号：剩余任务按旧号从小到大重排为 1..N，不留空号。
+          // 号变了旧定时 key 也失效，先删掉全部旧定时再用新号重排并重新注册，
+          // 否则旧闭包拿旧号去 DB 里找任务，找不到就不写运行结果。
+          const renumbered: string[] = [];
+          const rescheduleFailed: string[] = [];
+          if (deleted.length > 0) {
+            if (db.data.tasks.length > 0) {
+              const sorted = [...db.data.tasks].sort(
+                (a, b) => (Number(a.id) || 0) - (Number(b.id) || 0),
+              );
+              for (const t of db.data.tasks)
+                cronManager.del(makeCronKey(t.id));
+              sorted.forEach((t, i) => {
+                const newId = String(i + 1);
+                if (t.id !== newId) renumbered.push(`${t.id}→${newId}`);
+                t.id = newId;
+              });
+              db.data.tasks = sorted;
+              db.data.seq = String(sorted.length);
+              for (const t of sorted) {
+                try {
+                  await scheduleTask(t);
+                } catch (e) {
+                  rescheduleFailed.push(t.id);
+                }
+              }
+            } else {
+              db.data.seq = "0";
+            }
+            await db.write();
+          }
           if (deleted.length === 1 && notFound.length === 0) {
-            // 单个删除时保持旧回复格式不变
+            // 单个删除时保持旧回复格式不变；补过号就多一行告诉用户新号
             const onlyId = uniqueIds[0];
+            const renumberLine =
+              renumbered.length > 0
+                ? `\n已重新编号：${renumbered
+                    .map((r) => `<code>${r}</code>`)
+                    .join("，")}`
+                : "";
+            const failedLine =
+              rescheduleFailed.length > 0
+                ? `\n定时重注册失败：${rescheduleFailed
+                    .map((r) => `<code>${r}</code>`)
+                    .join("，")}，请重启 TeleBox 后再看`
+                : "";
             await msg.edit({
-              text: `✅ 已删除任务 <code>${onlyId}</code>`,
+              text: `✅ 已删除任务 <code>${onlyId}</code>${renumberLine}${failedLine}`,
               parseMode: "html",
             });
             return;
@@ -1724,6 +1798,18 @@ class AcronPlugin extends Plugin {
               `✅ 已删除任务: ${deleted
                 .map((d) => `<code>${d}</code>`)
                 .join("，")}`,
+            );
+          if (renumbered.length > 0)
+            lines.push(
+              `已重新编号：${renumbered
+                .map((r) => `<code>${r}</code>`)
+                .join("，")}`,
+            );
+          if (rescheduleFailed.length > 0)
+            lines.push(
+              `定时重注册失败：${rescheduleFailed
+                .map((r) => `<code>${r}</code>`)
+                .join("，")}，请重启 TeleBox 后再看`,
             );
           if (notFound.length > 0)
             lines.push(
@@ -1865,65 +1951,126 @@ class AcronPlugin extends Plugin {
           sub === "off" ||
           sub === "on"
         ) {
-          const id = args[1];
-          if (!id) {
+          // 输一个停/开一个，输多个停/开多个：.acron disable 7 8 9，也支持逗号分隔。
+          const ids = args
+            .slice(1)
+            .flatMap((a: string) => String(a).split(/[,，]+/))
+            .map((a: string) => a.trim())
+            .filter(Boolean);
+          const uniqueIds = [...new Set(ids)];
+          if (uniqueIds.length === 0) {
             await msg.edit({
               text:
-                sub === "disable"
-                  ? `请提供定时任务ID: <code>${mainPrefix}acron disable ID</code>`
-                  : `请提供定时任务ID: <code>${mainPrefix}acron enable ID</code>`,
+                sub === "disable" || sub === "off"
+                  ? `请提供定时任务ID: <code>${mainPrefix}acron disable ID [ID...]</code>，一次停多个请用空格分隔，例如 <code>${mainPrefix}acron disable 7 8 9</code>`
+                  : `请提供定时任务ID: <code>${mainPrefix}acron enable ID [ID...]</code>，一次开多个请用空格分隔，例如 <code>${mainPrefix}acron enable 7 8 9</code>`,
               parseMode: "html",
             });
             return;
           }
           const db = await getDB();
-          const idx = db.data.tasks.findIndex((t) => t.id === id);
-          if (idx < 0) {
+          const isDisable = sub === "disable" || sub === "off";
+          const done: { id: string; remark: string; nextAt?: string }[] = [];
+          const already: string[] = [];
+          const invalid: string[] = [];
+          const notFound: string[] = [];
+          for (const id of uniqueIds) {
+            const idx = db.data.tasks.findIndex((t) => t.id === id);
+            if (idx < 0) {
+              notFound.push(id);
+              continue;
+            }
+            const t = db.data.tasks[idx];
+            if (isDisable) {
+              if (t.disabled) {
+                already.push(`${id}${t.remark ? ` ${t.remark}` : ""}`);
+                continue;
+              }
+              const key = makeCronKey(id);
+              cronManager.del(key);
+              t.disabled = true;
+              done.push({ id, remark: t.remark || "" });
+            } else {
+              if (!cron.validateCronExpression(t.cron).valid) {
+                invalid.push(`${id}${t.remark ? ` ${t.remark}` : ""}`);
+                continue;
+              }
+              t.disabled = false;
+              done.push({
+                id,
+                remark: t.remark || "",
+                nextAt: formatDate(cron.sendAt(t.cron).toJSDate()),
+              });
+            }
+          }
+          if (done.length > 0) await db.write();
+          // 启用要重新排程；只在写库后做，失败的任务不影响其他
+          if (!isDisable) {
+            for (const d of done) {
+              const t = db.data.tasks.find((x) => x.id === d.id);
+              if (t) await scheduleTask(t as AcronTask);
+            }
+          }
+          // 单个且无其他情况时保持旧回复格式不变
+          if (
+            uniqueIds.length === 1 &&
+            done.length === 1 &&
+            already.length === 0 &&
+            invalid.length === 0 &&
+            notFound.length === 0
+          ) {
+            const d = done[0];
             await msg.edit({
-              text: `未找到任务: <code>${id}</code>`,
+              text: isDisable
+                ? `⏸️ 已禁用任务 <code>${d.id}</code>`
+                : `▶️ 已启用任务 <code>${d.id}</code>\n下次执行: ${d.nextAt}`,
               parseMode: "html",
             });
             return;
           }
-          const t = db.data.tasks[idx];
-          if (sub === "disable" || sub === "off") {
-            if (t.disabled) {
-              await msg.edit({
-                text: `任务 <code>${id}</code> 已处于禁用状态`,
-                parseMode: "html",
-              });
-              return;
+          const lines: string[] = [];
+          if (done.length > 0) {
+            if (isDisable) {
+              lines.push(
+                `⏸️ 已禁用任务: ${done
+                  .map(
+                    (d) =>
+                      `<code>${d.id}</code>${d.remark ? ` ${d.remark}` : ""}`,
+                  )
+                  .join("，")}`,
+              );
+            } else {
+              lines.push(`▶️ 已启用任务:`);
+              for (const d of done)
+                lines.push(
+                  `• <code>${d.id}</code>${d.remark ? ` ${d.remark}` : ""} 下次执行: ${d.nextAt}`,
+                );
             }
-            const key = makeCronKey(id);
-            cronManager.del(key);
-            t.disabled = true;
-            await db.write();
-            await msg.edit({
-              text: `⏸️ 已禁用任务 <code>${id}</code>`,
-              parseMode: "html",
-            });
-          } else {
-            if (!cron.validateCronExpression(t.cron).valid) {
-              await msg.edit({
-                text: `任务 <code>${id}</code> 的 Cron 表达式无效，无法启用`,
-                parseMode: "html",
-              });
-              return;
-            }
-            t.disabled = false;
-            await db.write();
-            await scheduleTask(t as AcronTask);
-            const nextAt = cron.sendAt(t.cron);
-            await msg.edit({
-              text: `▶️ 已启用任务 <code>${id}</code>\n下次执行: ${formatDate(
-                nextAt.toJSDate(),
-              )}`,
-              parseMode: "html",
-            });
           }
+          if (already.length > 0)
+            lines.push(
+              `已处于${isDisable ? "禁用" : "启用"}状态: ${already
+                .map((d) => `<code>${d}</code>`)
+                .join("，")}`,
+            );
+          if (invalid.length > 0)
+            lines.push(
+              `Cron 表达式无效，无法启用: ${invalid
+                .map((d) => `<code>${d}</code>`)
+                .join("，")}`,
+            );
+          if (notFound.length > 0)
+            lines.push(
+              `未找到任务: ${notFound
+                .map((d) => `<code>${d}</code>`)
+                .join("，")}`,
+            );
+          await msg.edit({
+            text: lines.join("\n") || "没有任务被修改",
+            parseMode: "html",
+          });
           return;
         }
-
         if (
           sub === "send" ||
           sub === "cmd" ||
