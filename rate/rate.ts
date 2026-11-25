@@ -287,6 +287,8 @@ class RatePlugin extends Plugin {
       `https://api.exchangerate.host/latest?base=${encodeURIComponent(key)}`,
       `https://open.er-api.com/v6/latest/${encodeURIComponent(key)}`,
       `https://api.frankfurter.app/latest?from=${encodeURIComponent(key)}`,
+      // AllRatesToday 公开 ECB 汇率表（无钥，返回 { result: 'success', rates: {...} }）
+      `https://allratestoday.com/api/open/latest/${encodeURIComponent(key)}`,
       // Coinbase 公共汇率（含法币与加密货币）
       `https://api.coinbase.com/v2/exchange-rates?currency=${encodeURIComponent(key.toUpperCase())}`,
       // jsDelivr 镜像的每日更新静态汇率（无钥，稳定）
@@ -296,7 +298,7 @@ class RatePlugin extends Plugin {
       try {
         const { data } = await axios.get(url, { timeout: 8000 });
         let rates: Record<string, number> | null = null;
-        // 标准结构与 open.er-api、frankfurter
+        // 标准结构与 open.er-api、frankfurter、allratestoday
         if (data?.rates) rates = data.rates;
         if (data?.result === 'success' && data?.rates) rates = data.rates;
         // Coinbase 结构: { data: { rates: { USD: "1", ... } } }
@@ -478,6 +480,14 @@ class RatePlugin extends Plugin {
         try {
           const { data } = await axios.get('https://api.frankfurter.app/currencies', { timeout: 8000 });
           this.vsFiats = new Set(Object.keys(data || {}).map(k => k.toLowerCase()));
+          this.vsFiatsTs = now;
+        } catch {}
+      }
+      // 4) allratestoday.com 公开 ECB 汇率表（取 rates 的键作为法币列表）
+      if (!this.vsFiats || this.vsFiats.size === 0) {
+        try {
+          const { data } = await axios.get('https://allratestoday.com/api/open/latest/usd', { timeout: 8000 });
+          this.vsFiats = new Set(Object.keys(data?.rates || {}).map(k => k.toLowerCase()));
           this.vsFiatsTs = now;
         } catch {}
       }
