@@ -86,7 +86,7 @@ const OFFICIAL_PROVIDER_PRESETS: Record<
   anthropic: {
     name: "Anthropic",
     base_url: "https://api.anthropic.com",
-    model: "claude-sonnet-4-5",
+    model: "claude-sonnet-5-5",
     type: "auto",
   },
 };
@@ -460,7 +460,9 @@ async function callAnthropic(
 ): Promise<string> {
   const response = await axios.post(
     `${normalizedBaseUrl(baseUrl)}/v1/messages`,
-    { model, max_tokens: 2000, messages: [{ role: "user", content: input }] },
+    // claude-sonnet-5-5 等新模型默认开启思考，思考 token 计入 max_tokens，
+    // 2000 会把正文挤掉，因此留足空间。
+    { model, max_tokens: 8192, messages: [{ role: "user", content: input }] },
     {
       headers: {
         "x-api-key": apiKey,
