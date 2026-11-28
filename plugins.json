@@ -163,6 +163,10 @@
     "url": "https://github.com/TeleBoxOrg/TeleBox-Plugins/blob/main/dme/dme.ts?raw=true",
     "desc": "删除指定数量的自己发送的消息"
   },
+  "domain": {
+    "url": "https://github.com/TeleBoxOrg/TeleBox-Plugins/blob/main/domain/domain.ts?raw=true",
+    "desc": "域名到期提醒"
+  },
   "duckduckgo": {
     "url": "https://github.com/TeleBoxOrg/TeleBox-Plugins/blob/main/duckduckgo/duckduckgo.ts?raw=true",
     "desc": "DuckDuckGo 搜索"
