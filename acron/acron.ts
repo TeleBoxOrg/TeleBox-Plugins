@@ -1,6 +1,8 @@
 import { getPrefixes } from "@utils/pluginManager";
 import { Plugin, type PanelSettingsAdapter, type PanelSettingField } from "@utils/pluginBase";
 import { Api } from "teleproto";
+import { CallbackQuery, type CallbackQueryEvent } from "teleproto/events";
+import { Button } from "teleproto/tl/custom/button";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
 import { cronManager } from "@utils/cronManager";
 import * as cron from "cron";
@@ -115,7 +117,7 @@ type CollectTask = AcronTaskBase & {
   type: "collect";
   sourceChat: string; // 来源对话ID或@name
   sourceChatId?: string; // 解析后的来源对话ID（字符串），使用时转 number
-  sender: string; // 发送人：单个用户名（如 @kaige325）或数字 ID，或逗号分隔的多个发送人（最多 5 个，如 @DNSHEbot,@kaige325），无空格；写一个 * 或不写发送人，都表示任意真人用户（机器人除外，只看定时点之前、由近到远不限时间找，不回补已转过的旧消息）
+  sender: string; // 发送人：单个用户名（如 @example_user）或数字 ID，或逗号分隔的多个发送人（最多 5 个，如 @example_bot,@example_user），无空格；写一个 * 或不写发送人，都表示任意真人用户（机器人除外，只看定时点之前、由近到远不限时间找，不回补已转过的旧消息）
   maxCount: number; // 每轮最多转发条数，0 表示不限条数
   lastSeenId?: string; // 已处理过的最大消息 ID（字符串）
   // 回执接收人在基类 AcronTaskBase.receiptTo（所有定时任务通用），这里只留历史记录。
@@ -258,7 +260,7 @@ function parseCronFromArgs(
 // 收集转发：发送人识别辅助
 // 依次尝试 senderId?.userId、sender?.id、fromId?.userId；用户名取 sender?.username。
 // 若任务里 sender 是纯数字，则按数字 ID 匹配；否则按用户名匹配（忽略大小写和开头的 @）。
-// 多发送人：sender 可以是逗号分隔的列表（最多 5 个，如 @DNSHEbot,@kaige325），任一匹配即算命中，
+// 多发送人：sender 可以是逗号分隔的列表（最多 5 个，如 @example_bot,@example_user），任一匹配即算命中，
 // 这样一个发送人 24 小时内没说话时，其他发送人的消息仍能补上，避免整轮无话可转。
 function getMessageSenderId(m: any): number | undefined {
   const candidates = [
@@ -332,7 +334,7 @@ function isPlausibleSenderToken(token: string): boolean {
 
 // 真人用户判断：有发送人 ID、不是机器人、不是频道/匿名管理员身份。
 // 机器人判断依赖消息自带的 sender.bot 字段，TeleBox 拉取的群消息通常已带 sender，
-// 所以 @DNSHEbot 这类机器人消息能被挡住；sender 未加载时按非机器人处理，避免正常用户消息因缓存缺失被误杀。
+// 所以 @example_bot 这类机器人消息能被挡住；sender 未加载时按非机器人处理，避免正常用户消息因缓存缺失被误杀。
 function isAnyUserMessage(m: any): boolean {
   if (getMessageSenderId(m) === undefined) return false;
   if ((m as any)?.action !== undefined) return false; // 服务消息（入群、置顶等），不是用户说话
@@ -492,6 +494,23 @@ async function sendTaskReceipt(
   }
 }
 
+// 并发写回保护：同一秒多个任务一起跑时，各自在回调开头读到的 DB 都是旧快照，
+// 直接对旧快照 db.write() 会整份写回，把别的任务刚写的 lastRunAt/lastResult 盖回旧值
+// （2026-11-17：08:00 的 1/19/55 三个任务一起跑，1 号 cmd 执行命令最慢、最后写回，
+// 19 号“上次”停在 11/8、55 号停在 11/16）。写结果前重新读一份最新 DB，
+// 只改自己那一条再写回，别的任务的记录不会被盖掉。
+async function saveTaskPatch(
+  id: string,
+  patch: (t: AcronTask) => void,
+): Promise<AcronTask | undefined> {
+  const fresh = await getDB();
+  const i = fresh.data.tasks.findIndex((t) => t.id === id);
+  if (i < 0) return undefined;
+  patch(fresh.data.tasks[i]);
+  await fresh.write();
+  return fresh.data.tasks[i];
+}
+
 async function scheduleTask(task: AcronTask) {
   const key = makeCronKey(task.id);
   if (task.disabled) return;
@@ -506,6 +525,8 @@ async function scheduleTask(task: AcronTask) {
     // 下轮会把已转过的消息再当新消息转一遍。
     if (idx >= 0) Object.assign(task, db.data.tasks[idx]);
     const now = Date.now();
+    // 本轮写回后的最新任务（saveTaskPatch 返回），回执用它，不用回调开头读到的旧快照。
+    let latest: AcronTask | undefined;
     try {
       const client = await getGlobalClient();
       // NOTE: https://docs.telethon.dev/en/stable/concepts/entities.html
@@ -523,10 +544,11 @@ async function scheduleTask(task: AcronTask) {
           ...(replyTo ? { replyTo } : {}),
         });
         if (idx >= 0) {
-          db.data.tasks[idx].lastRunAt = String(now);
-          db.data.tasks[idx].lastResult = `已发送 1 条消息`;
-          db.data.tasks[idx].lastError = undefined;
-          await db.write();
+          latest = await saveTaskPatch(task.id, (s) => {
+            s.lastRunAt = String(now);
+            s.lastResult = `已发送 1 条消息`;
+            s.lastError = undefined;
+          });
         }
       } else if (task.type === "cmd") {
         const t = task as CmdTask;
@@ -539,10 +561,11 @@ async function scheduleTask(task: AcronTask) {
         if (cmd && sudoMsg)
           await dealCommandPluginWithMessage({ cmd, msg: sudoMsg as any });
         if (idx >= 0) {
-          db.data.tasks[idx].lastRunAt = String(now);
-          db.data.tasks[idx].lastResult = `已执行命令`;
-          db.data.tasks[idx].lastError = undefined;
-          await db.write();
+          latest = await saveTaskPatch(task.id, (s) => {
+            s.lastRunAt = String(now);
+            s.lastResult = `已执行命令`;
+            s.lastError = undefined;
+          });
         }
       } else if (task.type === "copy") {
         const t = task as CopyTask;
@@ -566,10 +589,11 @@ async function scheduleTask(task: AcronTask) {
           });
 
           if (idx >= 0) {
-            db.data.tasks[idx].lastRunAt = String(now);
-            db.data.tasks[idx].lastResult = `已复制发送 1 条消息`;
-            db.data.tasks[idx].lastError = undefined;
-            await db.write();
+            latest = await saveTaskPatch(task.id, (s) => {
+              s.lastRunAt = String(now);
+              s.lastResult = `已复制发送 1 条消息`;
+              s.lastError = undefined;
+            });
           }
         } catch (e: any) {
           throw e;
@@ -594,10 +618,11 @@ async function scheduleTask(task: AcronTask) {
           }),
         );
         if (idx >= 0) {
-          db.data.tasks[idx].lastRunAt = String(now);
-          db.data.tasks[idx].lastResult = `已转发 1 条消息`;
-          db.data.tasks[idx].lastError = undefined;
-          await db.write();
+          latest = await saveTaskPatch(task.id, (s) => {
+            s.lastRunAt = String(now);
+            s.lastResult = `已转发 1 条消息`;
+            s.lastError = undefined;
+          });
         }
       } else if (task.type === "collect") {
         // 定时收集转发：到点时拉取来源群最近消息，按发送人过滤；指定发送人时设了条数每轮必须转满规定条数，不够就往回找旧消息补足。
@@ -675,19 +700,20 @@ async function scheduleTask(task: AcronTask) {
             const skipResult = noMsgIn24h
               ? `无话可转，已跳过`
               : `暂无新消息，已跳过`;
-            db.data.tasks[idx].lastRunAt = String(now);
-            db.data.tasks[idx].lastResult = skipResult;
-            db.data.tasks[idx].lastError = undefined;
-            storedSkip.history = storedSkip.history || [];
-            storedSkip.history.push({
-              time: String(now),
-              count: 0,
-              ids: "",
-              result: skipResult,
+            await saveTaskPatch(task.id, (s) => {
+              const c = s as CollectTask;
+              c.lastRunAt = String(now);
+              c.lastResult = skipResult;
+              c.lastError = undefined;
+              c.history = c.history || [];
+              c.history.push({
+                time: String(now),
+                count: 0,
+                ids: "",
+                result: skipResult,
+              });
+              if (c.history.length > 20) c.history = c.history.slice(-20);
             });
-            if (storedSkip.history.length > 20)
-              storedSkip.history = storedSkip.history.slice(-20);
-            await db.write();
             // 跳过也要发回执（2026-11-04 用户定）：无话可转时回执里写 (无话可转)，让所有者知道这轮跑了但没东西可转。
             // 回执发送失败不影响本次结果，只记日志。
             const receiptRawSkip = String(storedSkip.receiptTo || "").trim();
@@ -753,8 +779,10 @@ async function scheduleTask(task: AcronTask) {
             }
           }
           if (idx >= 0) {
-            const stored = db.data.tasks[idx] as CollectTask;
-            db.data.tasks[idx].lastRunAt = String(now);
+            // 先算好本轮要写的值，再一次性写进最新 DB，不用回调开头的旧快照整份写回。
+            let nextLastSeen: string | undefined;
+            let nextResult: string;
+            let nextError: string | undefined;
             if (failed) {
               // 失败时只推进到最后一条成功转发的消息，失败消息下一轮重试，不紧循环重试；
               // 回补旧消息时不把已处理 ID 往回改，只在新消息成功时才推进。
@@ -763,42 +791,51 @@ async function scheduleTask(task: AcronTask) {
                 fresh.length > 0 &&
                 lastOkId >= fresh[fresh.length - 1].id
               )
-                stored.lastSeenId = String(lastOkId);
+                nextLastSeen = String(lastOkId);
               else if (
                 lastOkId !== undefined &&
                 fresh.length > 0 &&
                 lastSeen === undefined
               )
-                stored.lastSeenId = String(lastOkId);
-              db.data.tasks[idx].lastResult =
+                nextLastSeen = String(lastOkId);
+              nextResult =
                 forwarded > 0
                   ? `已转发 ${forwarded} 条${isFallback ? "（回补）" : ""}，后续失败`
                   : `转发失败`;
-              db.data.tasks[idx].lastError = String(failed?.message || failed);
+              nextError = String(failed?.message || failed);
             } else {
               // 成功时：有新消息就把本轮新消息的最大 ID 记为已处理；
               // 纯回补旧消息时不改已处理 ID，下轮新消息判断仍以原来为准，旧消息下轮还会再被回补。
               // 不限条数时本轮新消息已全部转发，所以这样记不会丢消息。
               if (fresh.length > 0)
-                stored.lastSeenId = String(fresh[fresh.length - 1].id);
-              db.data.tasks[idx].lastResult = `已转发 ${forwarded} 条消息${
+                nextLastSeen = String(fresh[fresh.length - 1].id);
+              nextResult = `已转发 ${forwarded} 条消息${
                 isFallback ? "（回补）" : ""
               }`;
-              db.data.tasks[idx].lastError = undefined;
+              nextError = undefined;
             }
             // 回执记录：每次有转发或失败都记历史（最近 20 次），与 lastResult 分开保存，
             // 下一次运行不会覆盖历史。回执只发给 setreceipt 指定的接收人私聊，不发到目标群和来源群；未设置时不发。
-            stored.history = stored.history || [];
-            stored.history.push({
+            const historyEntry = {
               time: String(now),
               count: forwarded,
               ids: forwardedIds.join(","),
-              result: db.data.tasks[idx].lastResult || "",
+              result: nextResult,
               error: failed ? String(failed?.message || failed) : undefined,
+            };
+            const saved = await saveTaskPatch(task.id, (s) => {
+              const c = s as CollectTask;
+              c.lastRunAt = String(now);
+              c.lastResult = nextResult;
+              c.lastError = nextError;
+              if (nextLastSeen !== undefined) c.lastSeenId = nextLastSeen;
+              c.history = c.history || [];
+              c.history.push(historyEntry);
+              if (c.history.length > 20) c.history = c.history.slice(-20);
             });
-            if (stored.history.length > 20)
-              stored.history = stored.history.slice(-20);
-            await db.write();
+            const stored =
+              (saved as CollectTask | undefined) ??
+              (db.data.tasks[idx] as CollectTask);
             // 转发成功或部分成功/失败后发回执；回执发送失败不影响本次转发结果，
             // 只记日志，不抛错、不重试，避免回执失败导致转发被误记为失败。
             // 后补规则：未设置 receiptTo 或 receiptTo 为 off 时只记历史，不发 Telegram 消息；
@@ -857,10 +894,11 @@ async function scheduleTask(task: AcronTask) {
           await client.deleteMessages(entityLike, [msgIdNum], { revoke: true });
         }
         if (idx >= 0) {
-          db.data.tasks[idx].lastRunAt = String(now);
-          db.data.tasks[idx].lastResult = `已尝试删除消息 ${t.msgId}`;
-          db.data.tasks[idx].lastError = undefined;
-          await db.write();
+          latest = await saveTaskPatch(task.id, (s) => {
+            s.lastRunAt = String(now);
+            s.lastResult = `已尝试删除消息 ${t.msgId}`;
+            s.lastError = undefined;
+          });
         }
       } else if (task.type === "del_re") {
         const t = task as DelReTask;
@@ -881,10 +919,11 @@ async function scheduleTask(task: AcronTask) {
           await client.deleteMessages(entityLike, ids, { revoke: true });
         }
         if (idx >= 0) {
-          db.data.tasks[idx].lastRunAt = String(now);
-          db.data.tasks[idx].lastResult = `匹配并删除 ${ids.length} 条`;
-          db.data.tasks[idx].lastError = undefined;
-          await db.write();
+          latest = await saveTaskPatch(task.id, (s) => {
+            s.lastRunAt = String(now);
+            s.lastResult = `匹配并删除 ${ids.length} 条`;
+            s.lastError = undefined;
+          });
         }
       } else if (task.type === "pin") {
         const t = task as PinTask;
@@ -895,10 +934,11 @@ async function scheduleTask(task: AcronTask) {
           pmOneSide: !!t.pmOneSide,
         });
         if (idx >= 0) {
-          db.data.tasks[idx].lastRunAt = String(now);
-          db.data.tasks[idx].lastResult = `已置顶消息 ${t.msgId}`;
-          db.data.tasks[idx].lastError = undefined;
-          await db.write();
+          latest = await saveTaskPatch(task.id, (s) => {
+            s.lastRunAt = String(now);
+            s.lastResult = `已置顶消息 ${t.msgId}`;
+            s.lastError = undefined;
+          });
         }
       } else if (task.type === "unpin") {
         const t = task as UnpinTask;
@@ -906,16 +946,17 @@ async function scheduleTask(task: AcronTask) {
         if (msgIdNum === undefined) throw new Error("无效的消息ID");
         await client.unpinMessage(entityLike, msgIdNum);
         if (idx >= 0) {
-          db.data.tasks[idx].lastRunAt = String(now);
-          db.data.tasks[idx].lastResult = `已取消置顶消息 ${t.msgId}`;
-          db.data.tasks[idx].lastError = undefined;
-          await db.write();
+          latest = await saveTaskPatch(task.id, (s) => {
+            s.lastRunAt = String(now);
+            s.lastResult = `已取消置顶消息 ${t.msgId}`;
+            s.lastError = undefined;
+          });
         }
       }
       // 通用回执（成功）：非收集任务跑完发一条；收集任务上面已自己发过回执，这里跳过，避免重复发两条。
       // 未设置 receiptTo 或设为 off 时 sendTaskReceipt 内部直接返回，不发。
       if (task.type !== "collect") {
-        const stored = idx >= 0 ? db.data.tasks[idx] : task;
+        const stored = latest ?? (idx >= 0 ? db.data.tasks[idx] : task);
         await sendTaskReceipt(
           client,
           stored,
@@ -928,16 +969,18 @@ async function scheduleTask(task: AcronTask) {
     } catch (e: any) {
       console.error(`[acron] 任务 ${task.id} 执行失败:`, e);
       if (idx >= 0) {
-        db.data.tasks[idx].lastRunAt = String(now);
-        db.data.tasks[idx].lastError = String(e?.message || e);
-        await db.write();
+        latest = await saveTaskPatch(task.id, (s) => {
+          s.lastRunAt = String(now);
+          s.lastError = String(e?.message || e);
+        });
       }
       // 通用回执（失败）：非收集任务失败也发一条；收集任务上面已自己发过回执（失败时还会 throw 到这里），这里跳过，避免重复。
       if (task.type !== "collect") {
         try {
           const failClient = await getGlobalClient();
           if (failClient) {
-            const stored = idx >= 0 ? db.data.tasks[idx] : task;
+            const stored =
+              latest ?? (idx >= 0 ? db.data.tasks[idx] : task);
             await sendTaskReceipt(
               failClient,
               stored,
@@ -998,8 +1041,8 @@ const help_text = `⚠️ 定制版（非官方）：已覆盖远程官方插件
 
 到点从来源群最近 100 条里，挑指定发送人的消息按时间顺序转到目标群。
 <pre>用法：  ${mainPrefix}acron collect &lt;6段cron&gt; &lt;目标&gt; &lt;来源&gt; &lt;发送人&gt; [条数] [备注]
-例：    ${mainPrefix}acron collect 0 0 1 * * * -1002443712513 -1003219886860 @kaige325 kaige收集08点（显示 08:00，不限条数）</pre>
-• 发送人：用户名或数字 ID，最多 5 个，英文逗号连、不要空格，如 @DNSHEbot,@kaige325；不写或写 * 就是任意真人用户，机器人除外。备注是纯英文单词时容易被误当发送人，不指定发送人时先写 * 或条数。
+例：    ${mainPrefix}acron collect 0 0 1 * * * -1001234567890 -1000987654321 @example_user kaige收集08点（显示 08:00，不限条数）</pre>
+• 发送人：用户名或数字 ID，最多 5 个，英文逗号连、不要空格，如 @example_bot,@example_user；不写或写 * 就是任意真人用户，机器人除外。备注是纯英文单词时容易被误当发送人，不指定发送人时先写 * 或条数。
 • 条数：发送人后跟数字就是每轮条数，不写不限，是所有发送人加起来的总数。
 • 指定发送人不够数时，往回找最近 24 小时内的旧消息补足（会重复）；任意用户模式只转新消息，不回补，没新消息就跳过。没消息也照样发回执。
 • 首轮没有已处理记录时，转最近历史里的消息。
@@ -1015,25 +1058,409 @@ const help_text = `⚠️ 定制版（非官方）：已覆盖远程官方插件
 
 一次改一个字段，可以同时改一个或多个任务，一条一条发。只发 <code>${mainPrefix}acron edit 任务号</code> 就是只看当前字段，不改。
 <pre>改时间：  ${mainPrefix}acron edit 16 time 0 0 13 * * *（改成 20:00，显示时间 = cron 小时 + 7）
-改目标：  ${mainPrefix}acron edit 16 target -1002443712513
-改多个：  ${mainPrefix}acron edit 39 40 target -1002443712513（一次改两个任务）
+批量改时间：${mainPrefix}acron edit 3 4 5 6 7 8 9 time 02:00 02:35 03:10 03:45 04:20 04:55 05:30（直接写显示时间，个数和任务数一样就按位置一一对应；写 1 个就是全改成同一个时间；也可以写 6 段 Cron）
+改目标：  ${mainPrefix}acron edit 16 target -1001234567890
+改多个：  ${mainPrefix}acron edit 39 40 target -1001234567890（一次改两个任务）
 改备注：  ${mainPrefix}acron edit 16 remark 新备注（写 - 清空）
-改来源：  ${mainPrefix}acron edit 16 source -1003219886860（收集任务；改来源会清空已处理 ID）
+改内容：  ${mainPrefix}acron edit 16 message 新内容（发送/命令任务；多个 ID 就是批量）
+批量改内容：${mainPrefix}acron edit 5 6 8 message 电影 听戏 ns是什么（值的个数和任务个数一样时按位置一一对应：5=电影，6=听戏，8=ns是什么；个数不一样时拼成一句话，全改成同一个内容）
+改来源：  ${mainPrefix}acron edit 16 source -1000987654321（收集任务；改来源会清空已处理 ID）
 改发送人：${mainPrefix}acron edit 16 sender *（收集任务；* = 任意真人用户，最多 5 个，英文逗号连）
 改条数：  ${mainPrefix}acron edit 16 count 1（收集任务；0 = 不限）
 只看：    ${mainPrefix}acron edit 16</pre>
 
-改完保留任务号、历史、回执和已处理 ID（改来源除外）。消息内容和源消息不能用 edit 改，仍需删了重建。改完用 <code>${mainPrefix}acron ls all</code> 核对。
+改完保留任务号、历史、回执和已处理 ID（改来源除外）。源消息不能用 edit 改，仍需删了重建。改完用 <code>${mainPrefix}acron ls all</code> 核对。
 
-• <code>${mainPrefix}acron list</code> / <code>${mainPrefix}acron ls</code> - 列出当前会话的任务；<code>${mainPrefix}acron ls all</code> / <code>${mainPrefix}acron la</code> - 列出全部任务，一页最多 10 个，<code>${mainPrefix}acron ls all 2</code> 看第 2 页
+• <code>${mainPrefix}acron list</code> / <code>${mainPrefix}acron ls</code> - 列出当前会话的任务；<code>${mainPrefix}acron ls all</code> / <code>${mainPrefix}acron la</code> - 列出全部任务，一页最多 10 个，<code>${mainPrefix}acron ls all 2</code> 看第 2 页，点一下页脚的下一页命令就复制，粘贴发送即可翻页
 • <code>${mainPrefix}acron rm 任务ID [任务ID...]</code> - 删除任务，如 <code>${mainPrefix}acron rm 7 8 9</code>；删完自动往前补号，不留空号（后面的任务号会变，删之前先看 <code>${mainPrefix}acron ls all</code> 核对）
 • <code>${mainPrefix}acron disable/off 任务ID [任务ID...]</code> - 禁用一个或多个任务
 • <code>${mainPrefix}acron enable/on 任务ID [任务ID...]</code> - 启用一个或多个任务
 `;
 
+// 任务类型中文名（列表和翻页共用）。
+function acronTypeLabel(tp?: AcronType): string {
+  return tp === "send"
+    ? "发送"
+    : tp === "cmd"
+      ? "命令"
+      : tp === "copy"
+        ? "复制"
+        : tp === "forward"
+          ? "转发"
+          : tp === "del"
+            ? "删除"
+            : tp === "del_re"
+              ? "正则删除"
+              : tp === "pin"
+                ? "置顶"
+                : tp === "unpin"
+                  ? "取消置顶"
+                  : tp === "collect"
+                    ? "收集转发"
+                    : String(tp || "");
+}
+
+// 列表文字分片：单条消息最多 3500 字，预留富文本开销。
+function splitListText(full: string): string[] {
+  const MAX = 3500;
+  const chunks: string[] = [];
+  for (let i = 0; i < full.length; i += MAX) {
+    chunks.push(full.slice(i, i + MAX));
+  }
+  return chunks.length > 0 ? chunks : [full];
+}
+
+// 列表翻页按钮：点一下翻页，不用输命令。回调数据 acron:ls:<范围>:<类型>:<页码>，
+// 范围 a=全部 c=当前会话，类型 -=不限；中间的“第 X/Y 页”点一下是刷新当前页。
+function listPageButtons(
+  scopeAll: boolean,
+  typeFilter: AcronType | undefined,
+  pageNum: number,
+  totalPages: number,
+): any[] | undefined {
+  if (totalPages <= 1) return undefined;
+  const scope = scopeAll ? "a" : "c";
+  const type = typeFilter ?? "-";
+  const data = (p: number) =>
+    Buffer.from(`acron:ls:${scope}:${type}:${p}`, "utf-8");
+  const row: any[] = [];
+  if (pageNum > 1) row.push(Button.inline("◀️ 上一页", data(pageNum - 1)));
+  row.push(Button.inline(`第 ${pageNum}/${totalPages} 页`, data(pageNum)));
+  if (pageNum < totalPages)
+    row.push(Button.inline("下一页 ▶️", data(pageNum + 1)));
+  return [row];
+}
+
+// 列表一页的渲染（命令和翻页按钮共用）：返回整页文字和翻页按钮。
+async function renderListPage(opts: {
+  scopeAll: boolean;
+  typeFilter?: AcronType;
+  wantPage: number;
+  chatId: number;
+}): Promise<{
+  text: string;
+  buttons?: any;
+  total: number;
+  totalPages: number;
+  pageNum: number;
+}> {
+  const { scopeAll, typeFilter, wantPage, chatId } = opts;
+  const PAGE_SIZE = 10;
+  const db = await getDB();
+  const tasks = db.data.tasks
+    .filter(
+      (t) =>
+        (scopeAll ? true : Number((t as any).chatId) === chatId) &&
+        (!typeFilter || t.type === typeFilter),
+    )
+    // 先展示已启用的，再展示已禁用的
+    .sort((a, b) => {
+      const ad = a.disabled ? 1 : 0;
+      const bd = b.disabled ? 1 : 0;
+      return ad - bd;
+    });
+
+  if (tasks.length === 0) {
+    const noneText = scopeAll
+      ? typeFilter
+        ? `暂无类型为 ${acronTypeLabel(typeFilter)} 的定时任务`
+        : "暂无定时任务"
+      : typeFilter
+        ? `当前会话暂无类型为 ${acronTypeLabel(typeFilter)} 的定时任务`
+        : "当前会话暂无定时任务";
+    return {
+      text: noneText,
+      buttons: undefined,
+      total: 0,
+      totalPages: 1,
+      pageNum: 1,
+    };
+  }
+
+  const lines: string[] = [];
+  const header = scopeAll
+    ? typeFilter
+      ? `📋 所有 ${acronTypeLabel(typeFilter)} 定时任务`
+      : "📋 所有定时任务"
+    : typeFilter
+      ? `📋 当前会话 ${acronTypeLabel(typeFilter)} 定时任务`
+      : "📋 当前会话定时任务";
+  lines.push(header);
+  lines.push("");
+
+  // 分页：一页最多 10 个，页码超出范围就取最后一页
+  const total = tasks.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pageNum = Math.min(wantPage, totalPages);
+  const pageTasks = tasks.slice(
+    (pageNum - 1) * PAGE_SIZE,
+    pageNum * PAGE_SIZE,
+  );
+
+  // 分块显示：先启用，再禁用；如果对应块为空则不显示表头
+  const enabledTasks = pageTasks.filter((t) => !t.disabled);
+  const disabledTasks = pageTasks.filter((t) => t.disabled);
+
+  if (enabledTasks.length > 0) {
+    lines.push("🔛 已启用:");
+    for (const t of enabledTasks) {
+      const nextDt = cron.sendAt(t.cron);
+      const entityInfo = await formatEntity(
+        (t as any).chatId ?? t.chat,
+      );
+      const title = `<code>${t.id}</code> • <code>${acronTypeLabel(
+        t.type,
+      )}</code>${t.remark ? ` • ${t.remark}` : ""}`;
+      lines.push(title);
+      lines.push(
+        `对话: ${
+          (entityInfo?.entity ? entityInfo?.display : t.display) ||
+          `<code>${t.chat}</code>`
+        }`,
+      );
+      if (t.type === "collect") {
+        const ct = t as CollectTask;
+        const sourceInfo = await formatEntity(
+          ct.sourceChatId ?? ct.sourceChat,
+        );
+        lines.push(
+          `来源: ${sourceInfo?.display || `<code>${ct.sourceChat}</code>`}`,
+        );
+        lines.push(`发送人: <code>${ct.sender}</code>`);
+        lines.push(
+          `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
+        );
+        if (ct.lastSeenId) {
+          lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
+        }
+        if (ct.history && ct.history.length > 0) {
+          const recent = ct.history.slice(-3);
+          lines.push(
+            `最近记录: ${recent
+              .map(
+                (h) =>
+                  `${formatDate(new Date(Number(h.time)))} ${h.result}${
+                    h.ids ? ` ID:${h.ids}` : ""
+                  }`,
+              )
+              .join(" | ")}`,
+          );
+        }
+      }
+      // 回执：所有定时任务通用，未设置 = 不发回执
+      lines.push(
+        `回执: ${
+          t.receiptTo
+            ? t.receiptTo === "off"
+              ? "已关闭"
+              : `<code>${t.receiptTo}</code>`
+            : "未设置（不发回执）"
+        }`,
+      );
+      const msgId = (t as any)?.msgId;
+      const fromChatId = (t as any)?.fromChatId;
+      const fromMsgId = (t as any)?.fromMsgId;
+      if (msgId) {
+        lines.push(
+          `消息: <a href="https://t.me/c/${String(
+            (t as any).chatId ?? t.chat,
+          ).replace("-100", "")}/${msgId}">${msgId}</a>`,
+        );
+      }
+      if (fromChatId && fromMsgId) {
+        lines.push(
+          `消息: <a href="https://t.me/c/${String(
+            fromChatId ?? "",
+          ).replace("-100", "")}/${fromMsgId}">${fromMsgId}</a>`,
+        );
+      }
+      if (
+        (t.type === "send" && (t as SendTask).replyTo) ||
+        (t.type === "cmd" && (t as CmdTask).replyTo) ||
+        (t.type === "copy" && (t as CopyTask).replyTo) ||
+        (t.type === "forward" && (t as ForwardTask).replyTo)
+      ) {
+        const replyId = (t as any).replyTo as string | undefined;
+        if (replyId)
+          lines.push(
+            `回复: <a href="https://t.me/c/${String(
+              (t as any).chatId ?? t.chat,
+            ).replace("-100", "")}/${replyId}">${replyId}</a>`,
+          );
+      }
+      if (nextDt) {
+        const dt: Date =
+          typeof (nextDt as any)?.toJSDate === "function"
+            ? (nextDt as any).toJSDate()
+            : nextDt instanceof Date
+              ? nextDt
+              : new Date(Number(nextDt));
+        lines.push(`下次: ${formatDate(dt)}`);
+      }
+      if (t.lastRunAt) {
+        lines.push(
+          `上次: ${formatDate(new Date(Number(t.lastRunAt)))}`,
+        );
+      }
+      if (t.lastResult) lines.push(`结果: ${t.lastResult}`);
+      if (t.lastError) lines.push(`错误: ${t.lastError}`);
+      lines.push(`复制: ${buildCopyCommand(t)}`);
+    }
+  }
+
+  if (disabledTasks.length > 0) {
+    lines.push("⏹ 已禁用:");
+    for (const t of disabledTasks) {
+      const entityInfo = await formatEntity(
+        (t as any).chatId ?? t.chat,
+      );
+      const title = `<code>${t.id}</code> • <code>${acronTypeLabel(
+        t.type,
+      )}</code>${t.remark ? ` • ${t.remark}` : ""}`;
+      lines.push(title);
+      lines.push(
+        `对话: ${entityInfo?.display || `<code>${t.chat}</code>`}`,
+      );
+      if (t.type === "collect") {
+        const ct = t as CollectTask;
+        const sourceInfo = await formatEntity(
+          ct.sourceChatId ?? ct.sourceChat,
+        );
+        lines.push(
+          `来源: ${sourceInfo?.display || `<code>${ct.sourceChat}</code>`}`,
+        );
+        lines.push(`发送人: <code>${ct.sender}</code>`);
+        lines.push(
+          `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
+        );
+        if (ct.lastSeenId) {
+          lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
+        }
+      }
+      lines.push(
+        `回执: ${
+          t.receiptTo
+            ? t.receiptTo === "off"
+              ? "已关闭"
+              : `<code>${t.receiptTo}</code>`
+            : "未设置（不发回执）"
+        }`,
+      );
+      // 禁用状态不显示下次执行
+      if (t.lastRunAt) {
+        lines.push(
+          `上次: ${formatDate(new Date(Number(t.lastRunAt)))}`,
+        );
+      }
+      if (t.lastResult) lines.push(`结果: ${t.lastResult}`);
+      if (t.lastError) lines.push(`错误: ${t.lastError}`);
+      lines.push(`复制: ${buildCopyCommand(t)}`);
+    }
+  }
+
+  // 页脚：多页时显示页码和下一页命令；命令包在 <code> 里，点一下就复制，
+  // 粘贴发送即可翻页（内联按钮已被 Telegram 服务器去掉，见 btntest 五轮测试）。
+  // 注意：Telegram 消息不支持红色文字（不支持 <span style> / <font color>，
+  // 只有加粗/斜体/下划线/代码块等），所以“显眼的红色”用加粗代替。
+  if (totalPages > 1) {
+    const nextCmd =
+      pageNum < totalPages
+        ? `，<b>查看下一页 复制：</b><code>${mainPrefix}acron ${
+            scopeAll ? "ls all" : "ls"
+          }${typeFilter ? ` ${typeFilter}` : ""} ${pageNum + 1}</code>`
+        : "";
+    lines.push(
+      `第 <b>${pageNum}/${totalPages}</b> 页，共 ${total} 个任务${nextCmd}`,
+    );
+  }
+  return {
+    text: lines.join("\n"),
+    buttons: listPageButtons(scopeAll, typeFilter, pageNum, totalPages),
+    total,
+    totalPages,
+    pageNum,
+  };
+}
+
+// 点翻页按钮：重新算一页，原地改掉这条消息；只有列表作者能翻页。
+async function handleListPageCallback(ev: CallbackQueryEvent) {
+  try {
+    const raw = ev.data
+      ? Buffer.from(ev.data as unknown as Uint8Array).toString("utf-8")
+      : "";
+    const m = raw.match(/^acron:ls:([ac]):([^:]*):(\d+)$/);
+    if (!m) return;
+    const scopeAll = m[1] === "a";
+    const typeFilter = (m[2] === "-" ? undefined : m[2]) as
+      | AcronType
+      | undefined;
+    const wantPage = Math.max(1, parseInt(m[3], 10) || 1);
+    let chatId = 0;
+    let author: string | undefined;
+    try {
+      const orig = await ev.getMessage();
+      chatId = Number((orig as any)?.chatId) || 0;
+      author = (orig as any)?.senderId?.toString();
+    } catch {
+      // 拿不到原消息时不校验作者
+    }
+    try {
+      const tapper = (
+        (ev as any)?.senderId ?? (ev.query as any)?.userId
+      )?.toString();
+      if (author && tapper && author !== tapper) {
+        await ev.answer({ message: "只有列表作者能翻页" });
+        return;
+      }
+    } catch {
+      // 校验失败时放行
+    }
+    const { text, buttons } = await renderListPage({
+      scopeAll,
+      typeFilter,
+      wantPage,
+      chatId,
+    });
+    const chunks = splitListText(text);
+    await ev.answer();
+    await ev.edit({
+      text: chunks[0],
+      parseMode: "html",
+      ...(buttons ? { buttons } : {}),
+    });
+    if (chunks.length > 1) {
+      const client = await getGlobalClient();
+      const orig = await ev.getMessage();
+      for (let i = 1; i < chunks.length; i++) {
+        await client.sendMessage((orig as any).peerId, {
+          message: chunks[i],
+          parseMode: "html",
+        });
+      }
+    }
+  } catch (e) {
+    console.error("[acron] 翻页失败:", e);
+    try {
+      await ev.answer({ message: "翻页失败，请重试" });
+    } catch {
+      // 已回答过时忽略
+    }
+  }
+}
+
 class AcronPlugin extends Plugin {
 
   description: string = `定时发送/转发/复制/置顶/取消置顶/删除消息/执行命令\n\n${help_text}`;
+  // 翻页按钮回调：点“上一页/下一页”直接翻页，不用输命令。
+  eventHandlers = [
+    {
+      event: new CallbackQuery({ pattern: /^acron:ls:/ }),
+      handler: async (ev: unknown) => {
+        await handleListPageCallback(ev as CallbackQueryEvent);
+      },
+    },
+  ];
+
   cmdHandlers: Record<
     string,
     (msg: Api.Message, trigger?: Api.Message) => Promise<void>
@@ -1057,8 +1484,7 @@ class AcronPlugin extends Plugin {
 
         if (sub === "list" || sub === "ls" || sub === "la") {
           // la 等同于 ls all；参数里找范围（all）、类型、页码，顺序不限。
-          // 一页最多 10 个：.acron ls all 2 看第 2 页，.acron ls all send 2 看发送任务的第 2 页。
-          const PAGE_SIZE = 10;
+          // 一页最多 10 个：.acron ls all 2 看第 2 页，也可以点消息下面的翻页按钮。
           const rawTokens = args
             .slice(1)
             .map((a: string) => String(a).toLowerCase());
@@ -1081,274 +1507,34 @@ class AcronPlugin extends Plugin {
           const pageToken = tokens.find((t) => /^\d+$/.test(t));
           const wantPage = Math.max(1, Number(pageToken) || 1);
 
-          const typeLabel = (tp?: AcronType) =>
-            tp === "send"
-              ? "发送"
-              : tp === "cmd"
-                ? "命令"
-                : tp === "copy"
-                  ? "复制"
-                  : tp === "forward"
-                    ? "转发"
-                    : tp === "del"
-                      ? "删除"
-                      : tp === "del_re"
-                        ? "正则删除"
-                        : tp === "pin"
-                          ? "置顶"
-                          : tp === "unpin"
-                            ? "取消置顶"
-                            : tp === "collect"
-                              ? "收集转发"
-                              : String(tp || "");
-
-          const db = await getDB();
-          const chatId = Number(msg.chatId);
-          const tasks = db.data.tasks
-            .filter(
-              (t) =>
-                (scopeAll ? true : Number((t as any).chatId) === chatId) &&
-                (!typeFilter || t.type === typeFilter),
-            )
-            // 先展示已启用的，再展示已禁用的
-            .sort((a, b) => {
-              const ad = a.disabled ? 1 : 0;
-              const bd = b.disabled ? 1 : 0;
-              return ad - bd;
+          const { text, buttons } = await renderListPage({
+            scopeAll,
+            typeFilter,
+            wantPage,
+            chatId: Number(msg.chatId),
+          });
+          const chunks = splitListText(text);
+          await msg.edit({
+            text: chunks[0],
+            parseMode: "html",
+            ...(buttons ? { buttons } : {}),
+          });
+          for (let i = 1; i < chunks.length; i++) {
+            await msg.client?.sendMessage(msg.peerId, {
+              message: chunks[i],
+              parseMode: "html",
             });
-
-          if (tasks.length === 0) {
-            const noneText = scopeAll
-              ? typeFilter
-                ? `暂无类型为 ${typeLabel(typeFilter)} 的定时任务`
-                : "暂无定时任务"
-              : typeFilter
-                ? `当前会话暂无类型为 ${typeLabel(typeFilter)} 的定时任务`
-                : "当前会话暂无定时任务";
-            await msg.edit({ text: noneText });
-            return;
-          }
-
-          const lines: string[] = [];
-          const header = scopeAll
-            ? typeFilter
-              ? `📋 所有 ${typeLabel(typeFilter)} 定时任务`
-              : "📋 所有定时任务"
-            : typeFilter
-              ? `📋 当前会话 ${typeLabel(typeFilter)} 定时任务`
-              : "📋 当前会话定时任务";
-          lines.push(header);
-          lines.push("");
-
-          // 分页：一页最多 10 个，页码超出范围就取最后一页
-          const total = tasks.length;
-          const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-          const pageNum = Math.min(wantPage, totalPages);
-          const pageTasks = tasks.slice(
-            (pageNum - 1) * PAGE_SIZE,
-            pageNum * PAGE_SIZE,
-          );
-
-          // 分块显示：先启用，再禁用；如果对应块为空则不显示表头
-          const enabledTasks = pageTasks.filter((t) => !t.disabled);
-          const disabledTasks = pageTasks.filter((t) => t.disabled);
-
-          if (enabledTasks.length > 0) {
-            lines.push("🔛 已启用:");
-            for (const t of enabledTasks) {
-              const nextDt = cron.sendAt(t.cron);
-              const entityInfo = await formatEntity(
-                (t as any).chatId ?? t.chat,
-              );
-              const title = `<code>${t.id}</code> • <code>${typeLabel(
-                t.type,
-              )}</code>${t.remark ? ` • ${t.remark}` : ""}`;
-              lines.push(title);
-              lines.push(
-                `对话: ${
-                  (entityInfo?.entity ? entityInfo?.display : t.display) ||
-                  `<code>${t.chat}</code>`
-                }`,
-              );
-              if (t.type === "collect") {
-                const ct = t as CollectTask;
-                const sourceInfo = await formatEntity(
-                  ct.sourceChatId ?? ct.sourceChat,
-                );
-                lines.push(
-                  `来源: ${sourceInfo?.display || `<code>${ct.sourceChat}</code>`}`,
-                );
-                lines.push(`发送人: <code>${ct.sender}</code>`);
-                lines.push(
-                  `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
-                );
-                if (ct.lastSeenId) {
-                  lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
-                }
-                if (ct.history && ct.history.length > 0) {
-                  const recent = ct.history.slice(-3);
-                  lines.push(
-                    `最近记录: ${recent
-                      .map(
-                        (h) =>
-                          `${formatDate(new Date(Number(h.time)))} ${h.result}${
-                            h.ids ? ` ID:${h.ids}` : ""
-                          }`,
-                      )
-                      .join(" | ")}`,
-                  );
-                }
-              }
-              // 回执：所有定时任务通用，未设置 = 不发回执
-              lines.push(
-                `回执: ${
-                  t.receiptTo
-                    ? t.receiptTo === "off"
-                      ? "已关闭"
-                      : `<code>${t.receiptTo}</code>`
-                    : "未设置（不发回执）"
-                }`,
-              );
-              const msgId = (t as any)?.msgId;
-              const fromChatId = (t as any)?.fromChatId;
-              const fromMsgId = (t as any)?.fromMsgId;
-              if (msgId) {
-                lines.push(
-                  `消息: <a href="https://t.me/c/${String(
-                    (t as any).chatId ?? t.chat,
-                  ).replace("-100", "")}/${msgId}">${msgId}</a>`,
-                );
-              }
-              if (fromChatId && fromMsgId) {
-                lines.push(
-                  `消息: <a href="https://t.me/c/${String(
-                    fromChatId ?? "",
-                  ).replace("-100", "")}/${fromMsgId}">${fromMsgId}</a>`,
-                );
-              }
-              if (
-                (t.type === "send" && (t as SendTask).replyTo) ||
-                (t.type === "cmd" && (t as CmdTask).replyTo) ||
-                (t.type === "copy" && (t as CopyTask).replyTo) ||
-                (t.type === "forward" && (t as ForwardTask).replyTo)
-              ) {
-                const replyId = (t as any).replyTo as string | undefined;
-                if (replyId)
-                  lines.push(
-                    `回复: <a href="https://t.me/c/${String(
-                      (t as any).chatId ?? t.chat,
-                    ).replace("-100", "")}/${replyId}">${replyId}</a>`,
-                  );
-              }
-              if (nextDt) {
-                const dt: Date =
-                  typeof (nextDt as any)?.toJSDate === "function"
-                    ? (nextDt as any).toJSDate()
-                    : nextDt instanceof Date
-                      ? nextDt
-                      : new Date(Number(nextDt));
-                lines.push(`下次: ${formatDate(dt)}`);
-              }
-              if (t.lastRunAt) {
-                lines.push(
-                  `上次: ${formatDate(new Date(Number(t.lastRunAt)))}`,
-                );
-              }
-              if (t.lastResult) lines.push(`结果: ${t.lastResult}`);
-              if (t.lastError) lines.push(`错误: ${t.lastError}`);
-              lines.push(`复制: ${buildCopyCommand(t)}`);
-            }
-          }
-
-          if (disabledTasks.length > 0) {
-            lines.push("⏹ 已禁用:");
-            for (const t of disabledTasks) {
-              const entityInfo = await formatEntity(
-                (t as any).chatId ?? t.chat,
-              );
-              const title = `<code>${t.id}</code> • <code>${typeLabel(
-                t.type,
-              )}</code>${t.remark ? ` • ${t.remark}` : ""}`;
-              lines.push(title);
-              lines.push(
-                `对话: ${entityInfo?.display || `<code>${t.chat}</code>`}`,
-              );
-              if (t.type === "collect") {
-                const ct = t as CollectTask;
-                const sourceInfo = await formatEntity(
-                  ct.sourceChatId ?? ct.sourceChat,
-                );
-                lines.push(
-                  `来源: ${sourceInfo?.display || `<code>${ct.sourceChat}</code>`}`,
-                );
-                lines.push(`发送人: <code>${ct.sender}</code>`);
-                lines.push(
-                  `每轮条数: ${ct.maxCount > 0 ? `${ct.maxCount} 条` : "不限"}`,
-                );
-                if (ct.lastSeenId) {
-                  lines.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
-                }
-              }
-              lines.push(
-                `回执: ${
-                  t.receiptTo
-                    ? t.receiptTo === "off"
-                      ? "已关闭"
-                      : `<code>${t.receiptTo}</code>`
-                    : "未设置（不发回执）"
-                }`,
-              );
-              // 禁用状态不显示下次执行
-              if (t.lastRunAt) {
-                lines.push(
-                  `上次: ${formatDate(new Date(Number(t.lastRunAt)))}`,
-                );
-              }
-              if (t.lastResult) lines.push(`结果: ${t.lastResult}`);
-              if (t.lastError) lines.push(`错误: ${t.lastError}`);
-              lines.push(`复制: ${buildCopyCommand(t)}`);
-            }
-          }
-
-          // 页脚：多页时显示页码和下一页命令
-          if (totalPages > 1) {
-            const nextCmd =
-              pageNum < totalPages
-                ? `，下一页：${mainPrefix}acron ${
-                    scopeAll ? "ls all" : "ls"
-                  }${typeFilter ? ` ${typeFilter}` : ""} ${pageNum + 1}`
-                : "";
-            lines.push(
-              `第 ${pageNum}/${totalPages} 页，共 ${total} 个任务${nextCmd}`,
-            );
-          }
-
-          // 分片发送，避免超长
-          const full = lines.join("\n");
-          const MAX = 3500; // 预留富文本开销
-          const chunks: string[] = [];
-          for (let i = 0; i < full.length; i += MAX) {
-            chunks.push(full.slice(i, i + MAX));
-          }
-          if (chunks.length > 0) {
-            await msg.edit({ text: chunks[0], parseMode: "html" });
-            for (let i = 1; i < chunks.length; i++) {
-              await msg.client?.sendMessage(msg.peerId, {
-                message: chunks[i],
-                parseMode: "html",
-              });
-            }
           }
           return;
         }
 
         if (sub === "edit") {
           // 直接编辑：.acron edit <ID> [ID...] <字段> <新值>，不用删了重建，一次改一个字段，
-          // 可以同时改一个或多个任务。改时间、目标、备注适用于所有类型；source/sender/count 只适用于收集任务。
+          // 可以同时改一个或多个任务。改时间、目标、备注适用于所有类型；message 只适用于发送/命令任务；source/sender/count 只适用于收集任务。
           // 编辑保留任务 ID、创建时间、历史、回执和已处理ID（改来源除外：来源变了，旧已处理ID清空，
           // 否则新来源里 ID 更小的消息会被误当成已处理而跳过）。
-          // 不能用 edit 改的：send/cmd 的消息内容、copy/forward 的源消息，仍需删了重建。
-          const usage = `用法:\n<code>${mainPrefix}acron edit 任务ID [任务ID...] time 0 0 13 * * *</code> 改时间\n<code>${mainPrefix}acron edit 任务ID [任务ID...] target 对话ID/@name</code> 改目标（chat 也一样）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] remark 新备注</code> 改备注，写 <code>-</code> 清空备注\n收集任务专用:\n<code>${mainPrefix}acron edit 任务ID [任务ID...] source 来源对话ID/@name</code> 改来源（会清空已处理ID）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] sender @example_bot,@example_user</code> 改发送人（* = 任意真人用户，最多 5 个）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] count 2</code> 改每轮条数（0 = 不限）\n只写 <code>${mainPrefix}acron edit 任务ID</code> 查看当前可改的字段`;
+          // 不能用 edit 改的：copy/forward 的源消息，仍需删了重建。
+          const usage = `用法:\n<code>${mainPrefix}acron edit 任务ID [任务ID...] time 0 0 13 * * *</code> 改时间（也可以直接写显示时间 HH:MM，如 20:00；多个任务时写多个时间就按位置一一对应）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] target 对话ID/@name</code> 改目标（chat 也一样）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] remark 新备注</code> 改备注，写 <code>-</code> 清空备注\n<code>${mainPrefix}acron edit 任务ID [任务ID...] message 新内容</code> 改发送内容（发送/命令任务；多个 ID 时，值的个数和任务个数一样就按位置一一对应，不一样就拼成一句话全改成同一个内容）\n收集任务专用:\n<code>${mainPrefix}acron edit 任务ID [任务ID...] source 来源对话ID/@name</code> 改来源（会清空已处理ID）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] sender @example_bot,@example_user</code> 改发送人（* = 任意真人用户，最多 5 个）\n<code>${mainPrefix}acron edit 任务ID [任务ID...] count 2</code> 改每轮条数（0 = 不限）\n只写 <code>${mainPrefix}acron edit 任务ID</code> 查看当前可改的字段`;
           // 开头的纯数字 token 都是任务 ID，第一个非数字 token 是字段，之后全是新值。
           const rest = args.slice(1);
           const ids: string[] = [];
@@ -1401,6 +1587,13 @@ class AcronPlugin extends Plugin {
                 if (ct.lastSeenId)
                   cur.push(`已处理ID: <code>${ct.lastSeenId}</code>`);
               }
+              if (t.type === "send" || t.type === "cmd") {
+                const m = (t as SendTask | CmdTask).message || "";
+                const one = m.replace(/\s+/g, " ").trim();
+                cur.push(
+                  `内容: <code>${one.length > 60 ? `${one.slice(0, 60)}…` : one || "（无）"}</code>`,
+                );
+              }
               if (t.receiptTo)
                 cur.push(`回执: <code>${t.receiptTo}</code>`);
               cur.push(`备注: ${t.remark || "（无）"}`);
@@ -1445,7 +1638,11 @@ class AcronPlugin extends Plugin {
                       ? "count"
                       : fieldRaw === "remark" || fieldRaw === "备注"
                         ? "remark"
-                        : "";
+                        : fieldRaw === "message" ||
+                            fieldRaw === "content" ||
+                            fieldRaw === "内容"
+                          ? "message"
+                          : "";
           if (!field) {
             await msg.edit({
               text: `未知字段: <code>${fieldRaw}</code>\n${usage}`,
@@ -1454,32 +1651,99 @@ class AcronPlugin extends Plugin {
             return;
           }
           // 字段值先校验一次，通过后再逐个任务改
-          let parsedCron: string | undefined;
+          // 时间解析结果：长度 1 = 所有任务同一个时间；长度 = 任务个数 = 按位置一一对应
+          let parsedCrons: string[] = [];
           let resolvedChat: { id: string; display?: string } | undefined;
           let resolvedSource: { id: string; display?: string } | undefined;
           if (field === "time") {
-            const parsed = parseCronFromArgs(valueTokens);
-            if (!parsed || parsed.rest.length > 0) {
-              await msg.edit({
-                text: `时间后面只能写 6 段 Cron，例如: <code>${mainPrefix}acron edit ${ids[0]} time 0 0 13 * * *</code>`,
-                parseMode: "html",
-              });
+            // 时间支持两种写法，批量时都支持按位置一一对应：
+            // ① 6 段 Cron：写 1 个就是所有任务同一个时间；写任务个数 × 6 段就按位置一一对应。
+            // ② HH:MM（显示时间，不用算 cron 小时）：写 1 个就是所有任务同一个时间；
+            //    写任务个数个就按位置一一对应（如 7 个任务写 7 个时间）。
+            const isHHMM = (s: string) => /^\d{1,2}:\d{2}$/.test(s);
+            const hhmmToCron = (s: string): string | null => {
+              const m = s.match(/^(\d{1,2}):(\d{2})$/);
+              if (!m) return null;
+              const h = Number(m[1]);
+              const mm = Number(m[2]);
+              if (h < 0 || h > 23 || mm < 0 || mm > 59) return null;
+              // 显示时间 = cron 小时 + 7，所以 cron 小时 = 显示小时 - 7（+24 取模）
+              const cronH = (h - 7 + 24) % 24;
+              return `0 ${mm} ${cronH} * * *`;
+            };
+            const checkCron = (c: string) => {
+              const v = (cron as any).validateCronExpression
+                ? (cron as any).validateCronExpression(c)
+                : { valid: true };
+              return v;
+            };
+            const timeUsage = `时间写法：6 段 Cron（如 <code>0 0 13 * * *</code>）或 HH:MM 显示时间（如 <code>20:00</code>）；写 1 个就是所有任务同一个时间，写任务个数个就按位置一一对应，例如: <code>${mainPrefix}acron edit ${ids.join(" ")} time 02:00 02:35</code>`;
+            if (valueTokens.length === 0) {
+              await msg.edit({ text: timeUsage, parseMode: "html" });
               return;
             }
-            const validation = (cron as any).validateCronExpression
-              ? (cron as any).validateCronExpression(parsed.cron)
-              : { valid: true };
-            if (!validation.valid) {
-              await msg.edit({
-                text: `Cron 校验失败: ${validation.error || "无效表达式"}`,
-              });
-              return;
+            if (valueTokens.every(isHHMM)) {
+              // 全是 HH:MM：个数必须是 1 或任务个数
+              if (
+                valueTokens.length !== 1 &&
+                valueTokens.length !== targets.length
+              ) {
+                await msg.edit({
+                  text: `时间个数不对：写 1 个就是所有任务同一个时间，写 ${targets.length} 个就按位置一一对应\n${timeUsage}`,
+                  parseMode: "html",
+                });
+                return;
+              }
+              for (const tok of valueTokens) {
+                const c = hhmmToCron(tok);
+                if (!c) {
+                  await msg.edit({
+                    text: `时间格式不对: <code>${tok}</code>，请写 HH:MM，例如 02:00`,
+                    parseMode: "html",
+                  });
+                  return;
+                }
+                parsedCrons.push(c);
+              }
+            } else {
+              // 按 6 段 Cron 解析：6 段就是所有任务同一个时间，任务个数 × 6 段就按位置一一对应
+              if (
+                valueTokens.length !== 6 &&
+                valueTokens.length !== 6 * targets.length
+              ) {
+                await msg.edit({
+                  text: `时间个数不对：6 段 Cron 就是所有任务同一个时间，写 ${targets.length * 6} 段（每个任务 6 段）就按位置一一对应\n${timeUsage}`,
+                  parseMode: "html",
+                });
+                return;
+              }
+              for (let i = 0; i < valueTokens.length; i += 6) {
+                const group = valueTokens.slice(i, i + 6);
+                const parsed = parseCronFromArgs(group);
+                if (!parsed || parsed.rest.length > 0) {
+                  await msg.edit({
+                    text: `第 ${i / 6 + 1} 个时间不是有效的 6 段 Cron: <code>${group.join(" ")}</code>`,
+                    parseMode: "html",
+                  });
+                  return;
+                }
+                const v = checkCron(parsed.cron);
+                if (!v.valid) {
+                  await msg.edit({
+                    text: `Cron 校验失败: ${v.error || "无效表达式"}`,
+                  });
+                  return;
+                }
+                parsedCrons.push(parsed.cron);
+              }
             }
-            parsedCron = parsed.cron;
-          } else if (field === "remark") {
+          } else if (field === "remark" || field === "message") {
             if (valueTokens.length === 0) {
               await msg.edit({
-                text: `请写新备注，例如: <code>${mainPrefix}acron edit ${ids[0]} remark 新备注</code>，写 <code>-</code> 清空备注`,
+                text:
+                  field === "remark"
+                    ? `请写新备注，例如: <code>${mainPrefix}acron edit ${ids[0]} remark 新备注</code>，写 <code>-</code> 清空备注`
+                    : `请写新内容，例如: <code>${mainPrefix}acron edit ${ids[0]} message 新内容</code>`,
                 parseMode: "html",
               });
               return;
@@ -1538,11 +1802,20 @@ class AcronPlugin extends Plugin {
                     ? "发送人"
                     : field === "count"
                       ? "每轮条数"
-                      : "备注";
+                      : field === "message"
+                        ? "内容"
+                        : "备注";
           const changed: { t: AcronTask; oldText: string; newText: string }[] =
             [];
           const skipped: string[] = [];
           let clearedLastSeen = false;
+          // 批量改内容时按位置一一对应：值的个数正好等于任务个数时，第 i 个任务取第 i 个值
+          // （如 .acron edit 5 6 8 message 电影 听戏 ns是什么 → 5=电影，6=听戏，8=ns是什么）；
+          // 个数不一样时把所有值拼成一句话，所有任务改成同一个内容。
+          const positionalMessage =
+            field === "message" &&
+            targets.length > 1 &&
+            valueTokens.length === targets.length;
           for (const t of targets) {
             if (
               (field === "source" || field === "sender" || field === "count") &&
@@ -1551,9 +1824,17 @@ class AcronPlugin extends Plugin {
               skipped.push(`${t.id} 不是收集任务`);
               continue;
             }
+            if (field === "message" && t.type !== "send" && t.type !== "cmd") {
+              skipped.push(`${t.id} 不是发送/命令任务`);
+              continue;
+            }
             if (field === "time") {
               const oldCron = t.cron;
-              t.cron = parsedCron as string;
+              // parsedCrons 长度 1 = 所有任务同一个时间；长度 = 任务个数 = 按位置一一对应
+              t.cron =
+                parsedCrons.length > 1
+                  ? parsedCrons[targets.indexOf(t)]
+                  : parsedCrons[0];
               changed.push({ t, oldText: oldCron, newText: t.cron });
             } else if (field === "remark") {
               const joined = valueTokens.join(" ");
@@ -1586,6 +1867,25 @@ class AcronPlugin extends Plugin {
               if (ct.lastSeenId) clearedLastSeen = true;
               ct.lastSeenId = undefined;
               changed.push({ t, oldText: oldSource, newText: value });
+            } else if (field === "message") {
+              // 发送/命令任务的内容存在 message 字段里，直接改它，不用删了重建；
+              // 下次运行读的是 DB 里的新值（cron 回调每次都从 DB 重读任务），
+              // 下面统一的重新排程也会把新内容带进闭包。
+              // 批量时按位置一一对应（positionalMessage 为真时），否则拼成一句话全改成同一个内容。
+              const joined = positionalMessage
+                ? valueTokens[targets.indexOf(t)]
+                : valueTokens.join(" ");
+              const oldMessage = (t as SendTask | CmdTask).message || "";
+              (t as SendTask | CmdTask).message = joined;
+              const disp = (s: string) => {
+                const one = String(s).replace(/\s+/g, " ").trim();
+                return one.length > 200 ? `${one.slice(0, 200)}…` : one || "（无）";
+              };
+              changed.push({
+                t,
+                oldText: disp(oldMessage),
+                newText: disp(joined),
+              });
             } else if (field === "sender") {
               const ct = t as CollectTask;
               const value = valueTokens[0];
@@ -2354,7 +2654,7 @@ class AcronPlugin extends Plugin {
                 senderConsumed = 0;
               }
             }
-            // 多发送人：逗号分隔、无空格，最多 5 个，例如 @DNSHEbot,@kaige325
+            // 多发送人：逗号分隔、无空格，最多 5 个，例如 @example_bot,@example_user
             // 任意用户模式：发送人只写一个 *（或不写），不走 5 个上限，建任务时直接放行
             const senderList = parseSenderList(senderArg);
             if (!isAnyUserSender(senderArg) && senderList.length === 0) {
@@ -2363,7 +2663,7 @@ class AcronPlugin extends Plugin {
             }
             if (!isAnyUserSender(senderArg) && senderList.length > 5) {
               await msg.edit({
-                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再建，多个发送人之间用英文逗号连接、不要加空格，例如 @DNSHEbot,@kaige325`,
+                text: `发送人最多 5 个，你写了 ${senderList.length} 个，请删到 5 个以内再建，多个发送人之间用英文逗号连接、不要加空格，例如 @example_bot,@example_user`,
               });
               return;
             }
